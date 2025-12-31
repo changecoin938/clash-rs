@@ -44,7 +44,7 @@ use tokio::{
     sync::{Mutex, broadcast, mpsc, oneshot},
     task::JoinHandle,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 mod app;
 mod common;
@@ -180,8 +180,8 @@ pub fn start_scaffold(id: u32, opts: Options) -> Result<()> {
         &cwd,
         opts.log_file,
     );
-    // Build marker to confirm the running XCFramework is updated
-    info!("[CLASH] build_marker=ws_driver_task_v5_multi_instance");
+    // Build marker to confirm the running XCFramework is updated (warn so it shows with log-level=warn)
+    warn!("[CLASH] build_marker=ws_driver_task_v6_timeout300_warn_marker");
     rt.block_on(async {
         match start(id, config, cwd, log_tx).await {
             Err(e) => {

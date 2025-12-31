@@ -29,6 +29,7 @@ use crate::app::dns::ThreadSafeDNSResolver;
 use super::statistics_manager::Manager;
 
 const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
+const COPY_HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct Dispatcher {
     outbound_manager: ThreadSafeOutboundManager,
@@ -124,8 +125,8 @@ impl Dispatcher {
                     lhs,
                     rhs,
                     self.tcp_buffer_size,
-                    Duration::from_secs(10),
-                    Duration::from_secs(10),
+                    COPY_HALF_CLOSE_TIMEOUT,
+                    COPY_HALF_CLOSE_TIMEOUT,
                 )
                 .instrument(info_span!(
                     "copy_bidirectional",
