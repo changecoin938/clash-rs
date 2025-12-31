@@ -42,7 +42,6 @@ fn broken_pipe(msg: &'static str) -> std::io::Error {
 enum WsCmd {
     Data(Bytes),
     Flush(oneshot::Sender<std::io::Result<()>>),
-    Shutdown(oneshot::Sender<std::io::Result<()>>),
 }
 
 pub struct WebsocketConn {
@@ -50,7 +49,6 @@ pub struct WebsocketConn {
     read_rx: mpsc::Receiver<std::io::Result<Bytes>>,
     read_buffer: BytesMut,
     pending_flush: Option<oneshot::Receiver<std::io::Result<()>>>,
-    pending_shutdown: Option<oneshot::Receiver<std::io::Result<()>>>,
     closed: bool,
     last_error: Arc<Mutex<Option<std::io::Error>>>,
 }
@@ -77,7 +75,6 @@ impl WebsocketConn {
             read_rx,
             read_buffer: BytesMut::new(),
             pending_flush: None,
-            pending_shutdown: None,
             closed: false,
             last_error,
         }
@@ -100,14 +97,13 @@ impl WebsocketConn {
         tokio::spawn(async move {
             let (mut sink, mut ws_stream) = stream.split();
             let mut pending_bytes: usize = 0;
-            let mut shutting_down = false;
 
             loop {
                 tokio::select! {
                     biased;
 
                     // Prioritize reading so we can respond to Ping during heavy uploads.
-                    msg = ws_stream.next(), if !shutting_down => {
+                    msg = ws_stream.next() => {
                         match msg {
                             None => {
                                 Self::set_error(&last_error, broken_pipe("websocket stream ended"));
@@ -146,7 +142,7 @@ impl WebsocketConn {
                                 break;
                             }
                             Some(WsCmd::Data(bytes)) => {
-                                if shutting_down || last_error.lock().unwrap().is_some() {
+                                if last_error.lock().unwrap().is_some() {
                                     Self::set_error(&last_error, broken_pipe("websocket is closing"));
                                     break;
                                 }
@@ -175,15 +171,6 @@ impl WebsocketConn {
                                 if last_error.lock().unwrap().is_some() {
                                     break;
                                 }
-                            }
-                            Some(WsCmd::Shutdown(done)) => {
-                                shutting_down = true;
-                                let res = sink.flush().await.map_err(ws_err_to_io);
-                                if let Err(ref e) = res {
-                                    Self::set_error(&last_error, clone_io_error(e));
-                                }
-                                let _ = done.send(res);
-                                break;
                             }
                         }
                     }
@@ -301,38 +288,12 @@ impl AsyncWrite for WebsocketConn {
             self.closed = true;
             return Poll::Ready(Err(err));
         }
-        if self.closed {
-            return Poll::Ready(Ok(()));
-        }
-
-        if let Some(rx) = self.pending_shutdown.as_mut() {
-            match Pin::new(rx).poll(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Ok(Ok(()))) => {
-                    self.pending_shutdown = None;
-                    self.closed = true;
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Ok(Err(e))) => {
-                    self.pending_shutdown = None;
-                    self.closed = true;
-                    Poll::Ready(Err(e))
-                }
-                Poll::Ready(Err(_)) => {
-                    self.pending_shutdown = None;
-                    self.closed = true;
-                    Poll::Ready(Ok(()))
-                }
-            }
-        } else {
-            let (tx, rx) = oneshot::channel();
-            ready!(Pin::new(&mut self.write_tx).poll_ready(cx)).map_err(ws_err_to_io)?;
-            Pin::new(&mut self.write_tx)
-                .start_send(WsCmd::Shutdown(tx))
-                .map_err(ws_err_to_io)?;
-            self.pending_shutdown = Some(rx);
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
+        // IMPORTANT:
+        // `copy_bidirectional` uses `poll_shutdown()` as a half-close signal.
+        // WebSocket does not support true half-close. If we close the underlying WS here,
+        // we can trigger tungstenite's "Sending after closing is not allowed" on in-flight writes.
+        //
+        // So: flush pending frames (best-effort) and return Ok without closing the WS.
+        self.poll_flush(cx)
     }
 }
