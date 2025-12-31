@@ -4,7 +4,7 @@ use hyper_util::rt::TokioIo;
 use std::net::{Shutdown, TcpStream};
 
 pub fn start_clash(options: clash_lib::Options) -> Result<(), clash_lib::Error> {
-    clash_lib::start_scaffold(options)
+    clash_lib::start_scaffold(1, options)
 }
 
 pub fn wait_port_ready(port: u16) -> Result<(), clash_lib::Error> {

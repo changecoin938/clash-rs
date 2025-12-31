@@ -146,7 +146,7 @@ fn main() {
         )));
     }
 
-    match clash::start_scaffold(clash::Options {
+    match clash::start_scaffold(1, clash::Options {
         config: clash::Config::File(file),
         cwd: cli.directory.map(|x| x.to_string_lossy().to_string()),
         rt: Some(TokioRuntime::MultiThread),

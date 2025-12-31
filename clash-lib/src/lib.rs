@@ -37,7 +37,7 @@ use std::{
     collections::HashMap,
     io,
     path::PathBuf,
-    sync::{Arc, LazyLock, OnceLock, atomic::AtomicUsize},
+    sync::{Arc, LazyLock, OnceLock},
 };
 use thiserror::Error;
 use tokio::{
@@ -130,8 +130,7 @@ pub struct GlobalState {
 
 #[derive(Default)]
 pub struct RuntimeController {
-    runtime_counter: AtomicUsize,
-    shutdown_txs: HashMap<usize, mpsc::Sender<()>>,
+    shutdown_txs: HashMap<u32, mpsc::Sender<()>>,
 }
 
 impl RuntimeController {
@@ -139,23 +138,28 @@ impl RuntimeController {
         Self::default()
     }
 
-    pub fn register_runtime(&mut self, shutdown_tx: mpsc::Sender<()>) -> usize {
-        let id = self
-            .runtime_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    pub fn register_runtime(&mut self, id: u32, shutdown_tx: mpsc::Sender<()>) {
         self.shutdown_txs.insert(id, shutdown_tx);
-        id
     }
 
-    pub fn unregister_runtime(&mut self, id: usize) {
+    pub fn unregister_runtime(&mut self, id: u32) {
         self.shutdown_txs.remove(&id);
+    }
+
+    pub fn shutdown_runtime(&mut self, id: u32) -> bool {
+        if let Some(tx) = self.shutdown_txs.remove(&id) {
+            let _ = tx.blocking_send(());
+            true
+        } else {
+            false
+        }
     }
 }
 
 static RUNTIME_CONTROLLER: LazyLock<std::sync::Mutex<RuntimeController>> =
     LazyLock::new(|| std::sync::Mutex::new(RuntimeController::new()));
 
-pub fn start_scaffold(opts: Options) -> Result<()> {
+pub fn start_scaffold(id: u32, opts: Options) -> Result<()> {
     let rt = match opts.rt.as_ref().unwrap_or(&TokioRuntime::MultiThread) {
         TokioRuntime::MultiThread => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -177,9 +181,9 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
         opts.log_file,
     );
     // Build marker to confirm the running XCFramework is updated
-    info!("[CLASH] build_marker=ws_driver_task_v4_no_close_frame");
+    info!("[CLASH] build_marker=ws_driver_task_v5_multi_instance");
     rt.block_on(async {
-        match start(config, cwd, log_tx).await {
+        match start(id, config, cwd, log_tx).await {
             Err(e) => {
                 eprintln!("start error: {e}");
                 Err(e)
@@ -189,17 +193,12 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
     })
 }
 
-pub fn shutdown() -> bool {
-    let mut rt_ctrl = RUNTIME_CONTROLLER.lock().unwrap();
-    if rt_ctrl
-        .runtime_counter
-        .load(std::sync::atomic::Ordering::SeqCst)
-        == 0
-    {
-        return false; // No runtime to shut down
-    }
-    rt_ctrl.shutdown_txs.clear();
-    true
+pub fn shutdown(id: u32) -> bool {
+    let mut rt_ctrl = match RUNTIME_CONTROLLER.lock() {
+        Ok(ctrl) => ctrl,
+        Err(_) => return false,
+    };
+    rt_ctrl.shutdown_runtime(id)
 }
 
 static CRYPTO_PROVIDER_LOCK: OnceLock<()> = OnceLock::new();
@@ -221,6 +220,7 @@ pub fn setup_default_crypto_provider() {
     });
 }
 pub async fn start(
+    id: u32,
     config: InternalConfig,
     cwd: String,
     log_tx: broadcast::Sender<LogEvent>,
@@ -231,7 +231,7 @@ pub async fn start(
 
     {
         let mut rt_ctrl = RUNTIME_CONTROLLER.lock().unwrap();
-        rt_ctrl.register_runtime(shutdown_tx);
+        rt_ctrl.register_runtime(id, shutdown_tx);
     }
 
     let mut tasks = Vec::<Runner>::new();
