@@ -176,7 +176,8 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
         &cwd,
         opts.log_file,
     );
-
+    // Build marker to confirm the running XCFramework is updated
+    info!("[CLASH] build_marker=ws_driver_task_v3");
     rt.block_on(async {
         match start(config, cwd, log_tx).await {
             Err(e) => {
