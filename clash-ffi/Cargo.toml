@@ -5,7 +5,9 @@ version = { workspace = true }
 edition = { workspace = true }
 
 [dependencies]
-clash-lib = { path = "../clash-lib", default-features = false, features = ["shadowsocks", "tuic", "ssh", "zero_copy"] }
+# NOTE: `default-features = false` disables clash-lib's default crypto backend (aws-lc-rs),
+# which breaks `russh` unless we explicitly enable a backend feature.
+clash-lib = { path = "../clash-lib", default-features = false, features = ["shadowsocks", "tuic", "ssh", "zero_copy", "aws-lc-rs"] }
 
 [lib]
 name = "clashrs"
