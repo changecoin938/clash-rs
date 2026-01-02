@@ -1,0 +1,13 @@
+[package]
+name = "clash-ffi"
+repository = { workspace = true }
+version = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+clash-lib = { path = "../clash-lib",  features = ["shadowsocks", "tuic", "ssh", "zero_copy"] }
+
+[lib]
+name = "clashrs"
+crate-type = ["staticlib", "cdylib"]
+

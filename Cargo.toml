@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+
+members = [
+    "clash-bin",
+    "clash-lib",
+    "clash-doc",
+    "clash-ffi",
+    "clash-dns",
+    "clash-netstack"
+]
+
+default-members = ["clash-bin"]
+
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[workspace.package]
+version = "0.9.0"
+repository = "https://github.com/Watfaq/clash-rs.git"
+edition = "2024"
+authors = ["https://github.com/Watfaq/clash-rs/graphs/contributors"]
+homepage = "https://github.com/watfaq/clash-rs"
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+lto = "thin"
+strip = true
+debug = 2
+panic = "abort"
