@@ -168,7 +168,6 @@ impl TrackedStream {
         &mut self.inner
     }
 
-    #[cfg(all(target_os = "linux", feature = "zero_copy"))]
     pub fn trackers(
         &self,
     ) -> (
@@ -185,35 +184,34 @@ impl TrackedStream {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "zero_copy"))]
+#[allow(unused)]
 pub trait TrackCopy {
     fn track(&self, total: usize);
 }
-#[cfg(all(target_os = "linux", feature = "zero_copy"))]
+
 impl TrackCopy for ReadTracker {
     fn track(&self, total: usize) {
         self.push_downloaded(total);
     }
 }
-#[cfg(all(target_os = "linux", feature = "zero_copy"))]
+
 impl TrackCopy for WriteTracker {
     fn track(&self, total: usize) {
         self.push_uploaded(total);
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "zero_copy"))]
+#[allow(unused)]
 pub struct ReadTracker {
     tracker: Arc<TrackerInfo>,
     manager: Arc<Manager>,
 }
 
-#[cfg(all(target_os = "linux", feature = "zero_copy"))]
 impl ReadTracker {
     fn new(tracker: Arc<TrackerInfo>, manager: Arc<Manager>) -> Self {
         Self { tracker, manager }
     }
-
+    #[allow(dead_code)]
     fn push_downloaded(&self, download: usize) {
         self.manager.push_downloaded(download);
         self.tracker
@@ -222,17 +220,17 @@ impl ReadTracker {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "zero_copy"))]
+#[allow(unused)]
 pub struct WriteTracker {
     tracker: Arc<TrackerInfo>,
     manager: Arc<Manager>,
 }
-#[cfg(all(target_os = "linux", feature = "zero_copy"))]
+
 impl WriteTracker {
     fn new(tracker: Arc<TrackerInfo>, manager: Arc<Manager>) -> Self {
         Self { tracker, manager }
     }
-
+    #[allow(dead_code)]
     fn push_uploaded(&self, upload: usize) {
         self.manager.push_uploaded(upload);
         self.tracker
@@ -240,7 +238,7 @@ impl WriteTracker {
             .fetch_add(upload as u64, std::sync::atomic::Ordering::Release);
     }
 }
-#[cfg(all(target_os = "linux", feature = "zero_copy"))]
+
 impl Drop for TrackedStream {
     fn drop(&mut self) {
         debug!("untrack connection: {}", self.id());

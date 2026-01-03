@@ -32,6 +32,7 @@ use shadowsocks::{
 };
 use std::{fmt::Debug, io, sync::Arc};
 use tracing::debug;
+use crate::proxy::transport::Transport;
 
 pub struct HandlerOptions {
     pub name: String,
@@ -42,6 +43,8 @@ pub struct HandlerOptions {
     pub cipher: String,
     pub plugin: Option<Box<dyn Sip003Plugin>>,
     pub udp: bool,
+    pub transport: Option<Box<dyn Transport>>,
+    pub tls: Option<Box<dyn Transport>>,
 }
 
 pub struct Handler {
@@ -77,6 +80,18 @@ impl Handler {
         let stream: AnyStream = match &self.opts.plugin {
             Some(plugin) => plugin.proxy_stream(s).await?,
             None => s,
+        };
+
+        let stream = if let Some(tls) = self.opts.tls.as_ref() {
+            tls.proxy_stream(stream).await?
+        } else {
+            stream
+        };
+        
+        let stream: AnyStream = if let Some(transport) = self.opts.transport.as_ref() {
+            transport.proxy_stream(stream).await?
+        } else {
+            stream
         };
 
         let ctx = Context::new_shared(ServerType::Local);

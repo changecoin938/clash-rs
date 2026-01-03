@@ -3,7 +3,6 @@
 pub struct ScopeCall<F: FnOnce()> {
     pub c: Option<F>,
 }
-
 impl<F: FnOnce()> Drop for ScopeCall<F> {
     fn drop(&mut self) {
         self.c.take().unwrap()()

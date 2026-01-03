@@ -2,15 +2,12 @@ use super::dns::ThreadSafeDNSResolver;
 use crate::{
     app::net::DEFAULT_OUTBOUND_INTERFACE,
     common::{
-        errors::{IntoIoResultExt as _, new_io_error},
-        timed_future::TimedFuture,
-        tls::GLOBAL_ROOT_STORE,
+        errors::new_io_error, timed_future::TimedFuture, tls::GLOBAL_ROOT_STORE,
         utils::serialize_duration,
     },
     proxy::AnyOutboundHandler,
     session::Session,
 };
-use anyhow::Context;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
@@ -727,9 +724,7 @@ impl ProxyManager {
                 timeout,
                 TimedFuture::new(outbound.connect_stream(&sess, dns_resolver)),
             )
-            .await
-            .context("URL test timeout")
-            .into_io()?;
+            .await?;
             let stream = stream?;
 
             let req = Request::get(url)
@@ -993,7 +988,7 @@ mod tests {
             remote_content_manager,
         },
         config::internal::proxy::PROXY_DIRECT,
-        proxy::{direct, mocks::MockDummyOutboundHandler},
+        proxy::{direct::DIRECT_OUTBOUND_HANDLER, mocks::MockDummyOutboundHandler},
         tests::initialize,
     };
     use futures::TryFutureExt;
@@ -1004,14 +999,14 @@ mod tests {
         initialize();
         let mut mock_resolver = MockClashResolver::new();
         mock_resolver.expect_resolve().returning(|_, _| {
-            Ok(Some(std::net::IpAddr::V4(Ipv4Addr::new(142, 250, 66, 227))))
+            Ok(Some(std::net::IpAddr::V4(Ipv4Addr::new(172, 217, 167, 67))))
         });
         mock_resolver.expect_ipv6().return_const(false);
 
         let manager =
             remote_content_manager::ProxyManager::new(Arc::new(mock_resolver));
 
-        let mock_handler = Arc::new(direct::Handler::new(PROXY_DIRECT));
+        let mock_handler = Arc::new(DIRECT_OUTBOUND_HANDLER.clone());
 
         manager
             .url_test(

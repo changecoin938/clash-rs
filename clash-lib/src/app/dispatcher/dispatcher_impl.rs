@@ -493,7 +493,6 @@ type OutboundPacketSender = tokio::sync::mpsc::Sender<UdpPacket>; // outbound pa
 
 struct TimeoutUdpSessionManager {
     map: Arc<RwLock<OutboundHandleMap>>,
-
     cleaner: Option<JoinHandle<()>>,
 }
 
@@ -516,7 +515,6 @@ impl TimeoutUdpSessionManager {
         let cleaner = tokio::spawn(async move {
             trace!("timeout udp session cleaner scanning");
             let mut interval = tokio::time::interval(timeout);
-
             loop {
                 interval.tick().await;
                 trace!("timeout udp session cleaner ticking");

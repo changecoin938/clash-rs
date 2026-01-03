@@ -2,7 +2,6 @@ mod datagram;
 pub mod inbound;
 pub use inbound::get_runner as get_tun_runner;
 mod routes;
-mod stream;
 
 #[cfg(target_os = "linux")] // for tproxy
 pub use datagram::TunDatagram;
@@ -56,7 +55,7 @@ mod tests {
         let log_file_clone = log_file.clone();
 
         let handle = thread::spawn(|| {
-            start_scaffold(Options {
+            start_scaffold(1,Options {
                 config: Config::Str(conf.to_string()),
                 cwd: Some(cwd_clone),
                 rt: None,
@@ -81,7 +80,7 @@ mod tests {
 
         assert_eq!(buf[0], req[0]);
 
-        assert!(shutdown());
+        assert!(shutdown(1));
 
         thread::sleep(std::time::Duration::from_secs(1));
 
@@ -127,7 +126,7 @@ mod tests {
         let log_file_clone = log_file.clone();
 
         let handle = thread::spawn(|| {
-            start_scaffold(Options {
+            start_scaffold(1,Options {
                 config: Config::Str(conf.to_string()),
                 cwd: Some(cwd_clone),
                 rt: None,
@@ -155,7 +154,7 @@ mod tests {
 
         assert_eq!(b"hello", &buf[..5]);
 
-        assert!(shutdown());
+        assert!(shutdown(1));
 
         thread::sleep(std::time::Duration::from_secs(1));
 

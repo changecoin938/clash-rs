@@ -159,7 +159,6 @@ impl TuicConnection {
             gc_interval,
             gc_lifetime,
         ));
-
         conn
     }
 
@@ -249,11 +248,10 @@ impl From<&str> for UdpRelayMode {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum CongestionControl {
     Cubic,
     NewReno,
-    #[default]
     Bbr,
 }
 impl From<&str> for CongestionControl {
@@ -272,6 +270,12 @@ impl From<&str> for CongestionControl {
             );
             Self::default()
         }
+    }
+}
+
+impl Default for CongestionControl {
+    fn default() -> Self {
+        Self::Cubic
     }
 }
 

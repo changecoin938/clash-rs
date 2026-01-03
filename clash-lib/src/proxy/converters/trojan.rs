@@ -1,7 +1,6 @@
 use tracing::warn;
 
-const DEFAULT_ALPN: [&str; 2] = ["h2", "http/1.1"];
-const DEFAULT_WS_ALPN: [&str; 1] = ["http/1.1"];
+static DEFAULT_ALPN: [&str; 2] = ["h2", "http/1.1"];
 
 use crate::{
     Error,
@@ -12,6 +11,7 @@ use crate::{
         trojan::{Handler, HandlerOptions},
     },
 };
+use crate::proxy::transport::TcpHttpClient;
 
 impl TryFrom<OutboundTrojan> for Handler {
     type Error = crate::Error;
@@ -50,19 +50,13 @@ impl TryFrom<&OutboundTrojan> for Handler {
                         .as_ref()
                         .map(|x| x.to_owned())
                         .unwrap_or(s.common_opts.server.to_owned()),
-                    s.alpn.clone().or(Some({
-                        let network = s.network.as_deref();
-                        let alpn: &[&str] = if let Some("ws") = network {
-                            &DEFAULT_WS_ALPN
-                        } else {
-                            &DEFAULT_ALPN
-                        };
-
-                        alpn.iter()
+                    s.alpn.clone().or(Some(
+                        DEFAULT_ALPN
+                            .iter()
                             .copied()
                             .map(|x| x.to_owned())
-                            .collect::<Vec<String>>()
-                    })),
+                            .collect::<Vec<String>>(),
+                    )),
                     None,
                 );
                 Some(Box::new(client))
@@ -71,6 +65,18 @@ impl TryFrom<&OutboundTrojan> for Handler {
                 .network
                 .as_ref()
                 .map(|x| match x.as_str() {
+                    "tcp_http" => s
+                        .tcp_http_opts
+                        .as_ref()
+                        .map(|x| {
+                            let client: TcpHttpClient = (x, &s.common_opts)
+                                .try_into()
+                                .expect("invalid tcp_http options");
+                            Box::new(client) as _
+                        })
+                        .ok_or(Error::InvalidConfig(
+                            "tcp-http-opts is required for tcp_http".to_owned(),
+                        )),
                     "ws" => s
                         .ws_opts
                         .as_ref()

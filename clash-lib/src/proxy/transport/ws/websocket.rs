@@ -13,6 +13,7 @@ use crate::{
 pub struct WebsocketConn {
     inner: WebSocketStream<AnyStream>,
     read_buffer: BytesMut,
+    need_flush: bool,
 }
 
 impl Debug for WebsocketConn {
@@ -28,6 +29,7 @@ impl WebsocketConn {
         Self {
             inner: stream,
             read_buffer: BytesMut::new(),
+            need_flush: false,
         }
     }
 }
@@ -79,11 +81,15 @@ impl AsyncWrite for WebsocketConn {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        if !self.need_flush {
         ready!(Pin::new(&mut self.inner).poll_ready(cx)).map_err(map_io_error)?;
         let message = Message::Binary(Bytes::copy_from_slice(buf));
-        Pin::new(&mut self.inner)
-            .start_send(message)
-            .map_err(map_io_error)?;
+
+            Pin::new(&mut self.inner)
+                .start_send(message)
+                .map_err(map_io_error)?;
+            self.need_flush = true;
+        }
         ready!(self.poll_flush(cx)?);
         std::task::Poll::Ready(Ok(buf.len()))
     }
@@ -92,8 +98,13 @@ impl AsyncWrite for WebsocketConn {
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        let Self { inner, .. } = self.get_mut();
-        Pin::new(inner).poll_flush(cx).map_err(map_io_error)
+        let Self { inner, need_flush, .. } = self.get_mut();
+        if *need_flush{
+            let result= ready!(Pin::new(inner).poll_flush(cx).map_err(map_io_error));
+            *need_flush=false;
+            return Poll::Ready(result)
+        }
+        return Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(

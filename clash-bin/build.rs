@@ -1,6 +1,4 @@
-#![feature(cfg_version)]
-#![cfg_attr(not(version("1.88.0")), feature(let_chains))]
-
+#![feature(let_chains)]
 fn main() {
     let vars = ["CLASH_GIT_REF", "CLASH_GIT_SHA"];
     for var in vars {

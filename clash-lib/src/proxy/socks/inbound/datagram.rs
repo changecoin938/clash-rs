@@ -48,8 +48,8 @@ impl Encoder<(Bytes, SocksAddr)> for Socks5UDPCodec {
 }
 
 impl Decoder for Socks5UDPCodec {
-    type Error = std::io::Error;
     type Item = (SocksAddr, BytesMut);
+    type Error = std::io::Error;
 
     fn decode(
         &mut self,
@@ -129,9 +129,10 @@ impl Sink<UdpPacket> for InboundUdp<UdpFramed<Socks5UDPCodec>> {
     }
 
     fn start_send(self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
+        let aaa = item.data.into();
         let pin = self.get_mut();
         pin.inner.start_send_unpin((
-            (item.data.into(), item.src_addr),
+            (aaa, item.src_addr).into(),
             item.dst_addr.must_into_socket_addr(),
         ))
     }

@@ -1,5 +1,4 @@
-#![feature(cfg_version)]
-#![cfg_attr(not(version("1.88.0")), feature(let_chains))]
+#![feature(let_chains)]
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -137,8 +136,9 @@ fn main() {
 
     let mut _guard = None;
     if cli.help_improve {
+        let str = std::env::var("SENTRY_DSN").unwrap_or("".to_string());
         _guard = Some(sentry::init((
-            env!("SENTRY_DSN"),
+            str,
             sentry::ClientOptions {
                 release: sentry::release_name!(),
                 ..Default::default()
@@ -146,7 +146,7 @@ fn main() {
         )));
     }
 
-    match clash::start_scaffold(clash::Options {
+    match clash::start_scaffold(1,clash::Options {
         config: clash::Config::File(file),
         cwd: cli.directory.map(|x| x.to_string_lossy().to_string()),
         rt: Some(TokioRuntime::MultiThread),

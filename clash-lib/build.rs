@@ -6,7 +6,9 @@ fn main() -> std::io::Result<()> {
     }
 
     println!("cargo:rerun-if-changed=src/common/geodata/geodata.proto");
-    prost_build::compile_protos(
+    prost_build::Config::new()
+        .type_attribute(".", "#[allow(dead_code)]")
+        .compile_protos(
         &["src/common/geodata/geodata.proto"],
         &["src/common/geodata"],
     )

@@ -374,39 +374,14 @@ mod tests {
     };
     use rustls::ClientConfig;
     use std::{sync::Arc, time::Duration};
-    use tokio::task::JoinHandle;
-    mod addr {
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        const LOCAL: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-
-        pub(super) const UDP: SocketAddr = SocketAddr::new(LOCAL, 53553);
-        pub(super) const TCP: SocketAddr = SocketAddr::new(LOCAL, 53554);
-        pub(super) const DOT: SocketAddr = SocketAddr::new(LOCAL, 53555);
-        pub(super) const DOH: SocketAddr = SocketAddr::new(LOCAL, 53556);
-        pub(super) const DOH3: SocketAddr = SocketAddr::new(LOCAL, 53557);
-    }
-    async fn send_query(client: &mut Client) -> anyhow::Result<()> {
+    async fn send_query(client: &mut Client) {
         let name = Name::from_ascii("www.example.com.").unwrap();
 
-        let mut retries = 3;
-        let response = loop {
-            match client
-                .query(name.clone(), DNSClass::IN, RecordType::A)
-                .await
-            {
-                Ok(v) => {
-                    break v;
-                }
-                Err(e) => {
-                    retries -= 1;
-                    if retries == 0 {
-                        anyhow::bail!(e)
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-        };
+        let response = client
+            .query(name, DNSClass::IN, RecordType::A)
+            .await
+            .unwrap();
 
         let answers = response.answers();
 
@@ -415,11 +390,10 @@ mod tests {
         } else {
             unreachable!("unexpected result")
         }
-        Ok(())
     }
 
     #[tokio::test]
-    async fn test_multiple_dns_server() -> anyhow::Result<()> {
+    async fn test_multiple_dns_server() {
         setup_default_crypto_provider();
         env_logger::init();
 
@@ -442,21 +416,21 @@ mod tests {
         });
 
         let cfg = DNSListenAddr {
-            udp: Some(addr::UDP),
-            tcp: Some(addr::TCP),
+            udp: Some("127.0.0.1:53553".parse().unwrap()),
+            tcp: Some("127.0.0.1:53554".parse().unwrap()),
             dot: Some(DoTConfig {
-                addr: addr::DOT,
+                addr: "127.0.0.1:53555".parse().unwrap(),
                 ca_key: None,
                 ca_cert: None,
             }),
             doh: Some(DoHConfig {
-                addr: addr::DOH,
+                addr: "127.0.0.1:53556".parse().unwrap(),
                 hostname: Some("dns.example.com".to_string()),
                 ca_key: None,
                 ca_cert: None,
             }),
             doh3: Some(DoH3Config {
-                addr: addr::DOH3,
+                addr: "127.0.0.1:53557".parse().unwrap(),
                 hostname: Some("dns.example.com".to_string()),
                 ca_key: None,
                 ca_cert: None,
@@ -468,26 +442,33 @@ mod tests {
                 .await;
 
         assert!(listener.is_some());
-        let _: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-            listener.unwrap().await?;
-            Ok(())
+        tokio::spawn(async move {
+            listener.unwrap().await.unwrap();
         });
 
-        let stream =
-            UdpClientStream::builder(addr::UDP, TokioRuntimeProvider::new()).build();
+        let stream = UdpClientStream::<TokioRuntimeProvider>::builder(
+            "127.0.0.1:53553".parse().unwrap(),
+            TokioRuntimeProvider::new(),
+        )
+        .build();
 
-        let (mut client, handle) = client::Client::connect(stream).await?;
+        let (mut client, handle) = client::Client::connect(stream).await.unwrap();
         tokio::spawn(handle);
 
-        send_query(&mut client).await?;
+        send_query(&mut client).await;
 
-        let (stream, sender) =
-            TcpClientStream::new(addr::TCP, None, None, TokioRuntimeProvider::new());
+        let (stream, sender) = TcpClientStream::new(
+            "127.0.0.1:53554".parse().unwrap(),
+            None,
+            None,
+            TokioRuntimeProvider::new(),
+        );
 
-        let (mut client, handle) = client::Client::new(stream, sender, None).await?;
+        let (mut client, handle) =
+            client::Client::new(stream, sender, None).await.unwrap();
         tokio::spawn(handle);
 
-        send_query(&mut client).await?;
+        send_query(&mut client).await;
 
         let mut tls_config = ClientConfig::builder()
             .with_root_certificates(global_root_store().clone())
@@ -497,8 +478,8 @@ mod tests {
             .dangerous()
             .set_certificate_verifier(Arc::new(tls::DummyTlsVerifier::new()));
 
-        let (stream, sender) = tls_client_connect(
-            addr::DOT,
+        let (stream, sender) = tls_client_connect::<TokioRuntimeProvider>(
+            "127.0.0.1:53555".parse().unwrap(),
             "dns.example.com".to_owned(),
             Arc::new(tls_config),
             TokioRuntimeProvider::new(),
@@ -513,10 +494,11 @@ mod tests {
         .await
         .inspect_err(|e| {
             assert!(false, "Failed to connect to DoT server: {}", e);
-        })?;
+        })
+        .unwrap();
         tokio::spawn(handle);
 
-        send_query(&mut client).await?;
+        send_query(&mut client).await;
 
         let mut tls_config = ClientConfig::builder()
             .with_root_certificates(global_root_store().clone())
@@ -532,15 +514,15 @@ mod tests {
             TokioRuntimeProvider::new(),
         )
         .build(
-            addr::DOH,
+            "127.0.0.1:53556".parse().unwrap(),
             "dns.example.com".to_owned(),
             "/dns-query".to_owned(),
         );
 
-        let (mut client, handle) = client::Client::connect(stream).await?;
+        let (mut client, handle) = client::Client::connect(stream).await.unwrap();
         tokio::spawn(handle);
 
-        send_query(&mut client).await?;
+        send_query(&mut client).await;
 
         let mut tls_config = ClientConfig::builder()
             .with_root_certificates(global_root_store().clone())
@@ -555,15 +537,14 @@ mod tests {
             .crypto_config(tls_config)
             .clone()
             .build(
-                addr::DOH3,
+                "127.0.0.1:53557".parse().unwrap(),
                 "dns.example.com".to_owned(),
                 "/dns-query".to_owned(),
             );
 
-        let (mut client, handle) = client::Client::connect(stream).await?;
+        let (mut client, handle) = client::Client::connect(stream).await.unwrap();
         tokio::spawn(handle);
 
-        send_query(&mut client).await?;
-        Ok(())
+        send_query(&mut client).await;
     }
 }

@@ -24,22 +24,20 @@ use super::{
 use async_trait::async_trait;
 use futures::TryFutureExt;
 
+pub static DIRECT_OUTBOUND_HANDLER: Handler = Handler::new();
+
 #[derive(Clone)]
-pub struct Handler {
-    pub name: String,
-}
+pub struct Handler;
 
 impl Debug for Handler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Direct").field("name", &self.name).finish()
+        f.debug_struct("Direct").finish()
     }
 }
 
 impl Handler {
-    pub fn new(name: &str) -> Self {
-        Self {
-            name: name.to_owned(),
-        }
+    const fn new() -> Self {
+        Self
     }
 }
 
@@ -89,13 +87,8 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<BoxedChainedDatagram> {
         let family_hint = family_hint_for_session(sess, &resolver).await;
-        let bind_addr: std::net::IpAddr = if sess.source.is_ipv4() {
-            std::net::Ipv4Addr::UNSPECIFIED.into()
-        } else {
-            std::net::Ipv6Addr::UNSPECIFIED.into()
-        };
         let d = new_udp_socket(
-            Some((bind_addr, 0).into()),
+            Some(sess.source),
             sess.iface.as_ref(),
             #[cfg(target_os = "linux")]
             sess.so_mark,

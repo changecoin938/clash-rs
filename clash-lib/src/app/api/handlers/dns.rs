@@ -27,7 +27,7 @@ pub fn routes(resolver: ThreadSafeDNSResolver) -> Router<Arc<AppState>> {
 }
 
 #[derive(Deserialize)]
-struct DnsQuery {
+struct DnsQUery {
     name: String,
     #[serde(rename = "type")]
     typ: String,
@@ -35,7 +35,7 @@ struct DnsQuery {
 
 async fn query_dns(
     State(state): State<DNSState>,
-    q: Query<DnsQuery>,
+    q: Query<DnsQUery>,
 ) -> impl IntoResponse {
     if let crate::app::dns::ResolverKind::System = state.resolver.kind() {
         return (StatusCode::BAD_REQUEST, "Clash resolver is not enabled.")

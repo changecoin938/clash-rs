@@ -3,9 +3,9 @@ use crate::{
     Error,
     app::net::{OutboundInterface, get_interface_by_name, get_outbound_interface},
     common::trie,
-    config::def::{DNSListen, DNSMode, EdnsClientSubnet as DefEdnsClientSubnet},
+    config::def::{DNSListen, DNSMode},
 };
-use ipnet::{AddrParseError, Ipv4Net, Ipv6Net};
+use ipnet::AddrParseError;
 use regex::Regex;
 use serde::Deserialize;
 use std::{
@@ -22,7 +22,6 @@ pub struct NameServer {
     pub net: DNSNetMode,
     pub address: String,
     pub interface: Option<OutboundInterface>,
-    pub proxy: Option<String>,
 }
 impl Display for NameServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -36,12 +35,6 @@ pub struct FallbackFilter {
     pub geo_ip_code: String,
     pub ip_cidr: Option<Vec<ipnet::IpNet>>,
     pub domain: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct EdnsClientSubnet {
-    pub ipv4: Option<Ipv4Net>,
-    pub ipv6: Option<Ipv6Net>,
 }
 
 #[derive(Default)]
@@ -60,8 +53,6 @@ pub struct Config {
     pub store_smart_stats: bool,
     pub hosts: Option<trie::StringTrie<IpAddr>>,
     pub nameserver_policy: HashMap<String, NameServer>,
-    pub edns_client_subnet: Option<EdnsClientSubnet>,
-    pub fw_mark: Option<u32>,
 }
 
 impl Config {
@@ -83,8 +74,7 @@ impl Config {
 
             let host = url.host_str().expect("dns host must be valid");
 
-            let iface = Self::parse_outbound_interface(&url);
-            let proxy = Self::parse_outbound_proxy(&url);
+            let iface = url.fragment();
             let addr: String;
             let net: &str;
 
@@ -123,7 +113,7 @@ impl Config {
                 address: addr,
                 net,
                 interface: iface
-                    .map(|x| match x.as_str() {
+                    .map(|x| match x {
                         "auto" => {
                             get_outbound_interface().ok_or(Error::InvalidConfig(
                                 "DNS nameserver [auto] no outbound interface found"
@@ -137,7 +127,6 @@ impl Config {
                         ),
                     })
                     .transpose()?,
-                proxy,
             });
         }
 
@@ -205,34 +194,6 @@ impl Config {
             Ok(format!("{host}:{port}"))
         }
     }
-
-    pub fn parse_outbound_proxy(url: &Url) -> Option<String> {
-        let frag = url.fragment()?;
-        let pairs = frag.split("&");
-        for pair in pairs {
-            if pair.starts_with("proxy=") {
-                let outbound = pair.trim_start_matches("proxy=");
-                return Some(outbound.into());
-            } else if !pair.contains("=") {
-                return Some(pair.into());
-            }
-        }
-
-        None
-    }
-
-    pub fn parse_outbound_interface(url: &Url) -> Option<String> {
-        let frag = url.fragment()?;
-        let pairs = frag.split("&");
-        for first in pairs {
-            if first.starts_with("interface=") {
-                let iface = first.trim_start_matches("interface=");
-                return Some(iface.into());
-            }
-        }
-
-        None
-    }
 }
 
 impl TryFrom<crate::config::def::Config> for Config {
@@ -265,24 +226,16 @@ impl TryFrom<&crate::config::def::Config> for Config {
             )));
         }
 
-        let default_nameserver = Config::parse_nameserver(&dc.default_nameserver)?;
-
-        for ns in &default_nameserver {
-            let _ = ns.address.parse::<SocketAddr>().map_err(|_| {
+        for ns in &dc.default_nameserver {
+            let _ = ns.parse::<IpAddr>().map_err(|_| {
                 Error::InvalidConfig(String::from("default dns must be ip address"))
             })?;
         }
-
-        let edns_client_subnet = dc
-            .edns_client_subnet
-            .as_ref()
-            .map(parse_edns_client_subnet)
-            .transpose()?;
+        let default_nameserver = Config::parse_nameserver(&dc.default_nameserver)?;
 
         Ok(Self {
             enable: dc.enable,
             ipv6: c.ipv6 && dc.ipv6,
-            fw_mark: c.routing_mark,
             nameserver: nameservers,
             fallback,
             fallback_filter: dc.fallback_filter.clone().into(),
@@ -410,45 +363,8 @@ impl TryFrom<&crate::config::def::Config> for Config {
                 Some(tree)
             },
             nameserver_policy,
-            edns_client_subnet,
         })
     }
-}
-
-fn parse_edns_client_subnet(
-    ecs: &DefEdnsClientSubnet,
-) -> Result<EdnsClientSubnet, Error> {
-    let ipv4 = ecs
-        .ipv4
-        .as_ref()
-        .map(|value| {
-            value.parse::<Ipv4Net>().map_err(|_| {
-                Error::InvalidConfig(format!(
-                    "invalid edns-client-subnet ipv4 network: {value}"
-                ))
-            })
-        })
-        .transpose()?;
-
-    let ipv6 = ecs
-        .ipv6
-        .as_ref()
-        .map(|value| {
-            value.parse::<Ipv6Net>().map_err(|_| {
-                Error::InvalidConfig(format!(
-                    "invalid edns-client-subnet ipv6 network: {value}"
-                ))
-            })
-        })
-        .transpose()?;
-
-    if ipv4.is_none() && ipv6.is_none() {
-        return Err(Error::InvalidConfig(
-            "edns-client-subnet requires at least one of ipv4/ipv6".into(),
-        ));
-    }
-
-    Ok(EdnsClientSubnet { ipv4, ipv6 })
 }
 
 impl From<crate::config::def::FallbackFilter> for FallbackFilter {

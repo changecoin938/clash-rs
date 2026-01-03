@@ -1,11 +1,11 @@
 #![feature(cfg_version)]
 #![feature(ip)]
 #![feature(sync_unsafe_cell)]
+#![feature(let_chains)]
 #![feature(lazy_get)]
 #![feature(duration_millis_float)]
 #![cfg_attr(not(version("1.87.0")), feature(unbounded_shifts))]
-#![cfg_attr(not(version("1.88.0")), feature(let_chains))]
-
+use once_cell::sync::{Lazy};
 use crate::{
     app::{
         dispatcher::Dispatcher, dns, inbound::manager::InboundManager,
@@ -19,7 +19,6 @@ use crate::{
         def,
         internal::{InternalConfig, proxy::OutboundProxy},
     },
-    proxy::OutboundHandler,
 };
 use app::{
     dispatcher::StatisticsManager,
@@ -37,8 +36,9 @@ use std::{
     collections::HashMap,
     io,
     path::PathBuf,
-    sync::{Arc, LazyLock, OnceLock, atomic::AtomicUsize},
+    sync::{Arc, OnceLock},
 };
+
 use thiserror::Error;
 use tokio::{
     sync::{Mutex, broadcast, mpsc, oneshot},
@@ -128,34 +128,16 @@ pub struct GlobalState {
     cwd: String,
 }
 
-#[derive(Default)]
 pub struct RuntimeController {
-    runtime_counter: AtomicUsize,
-    shutdown_txs: HashMap<usize, mpsc::Sender<()>>,
+    shutdown_tx: Arc<mpsc::Sender<()>>,
 }
 
-impl RuntimeController {
-    pub fn new() -> Self {
-        Self::default()
-    }
 
-    pub fn register_runtime(&mut self, shutdown_tx: mpsc::Sender<()>) -> usize {
-        let id = self
-            .runtime_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.shutdown_txs.insert(id, shutdown_tx);
-        id
-    }
+// static RUNTIME_CONTROLLER: LazyLock<std::sync::Mutex<RuntimeController>> =
+//     LazyLock::new(|| std::sync::Mutex::new(RuntimeController::new()));
+static RUNTIME_CONTROLLER: Lazy<std::sync::Mutex<HashMap<u32, RuntimeController>>> = Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
 
-    pub fn unregister_runtime(&mut self, id: usize) {
-        self.shutdown_txs.remove(&id);
-    }
-}
-
-static RUNTIME_CONTROLLER: LazyLock<std::sync::Mutex<RuntimeController>> =
-    LazyLock::new(|| std::sync::Mutex::new(RuntimeController::new()));
-
-pub fn start_scaffold(opts: Options) -> Result<()> {
+pub fn start_scaffold(id:u32,opts: Options) -> Result<()> {
     let rt = match opts.rt.as_ref().unwrap_or(&TokioRuntime::MultiThread) {
         TokioRuntime::MultiThread => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -178,7 +160,7 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
     );
 
     rt.block_on(async {
-        match start(config, cwd, log_tx).await {
+        match start(id,config, cwd, log_tx).await {
             Err(e) => {
                 eprintln!("start error: {e}");
                 Err(e)
@@ -187,19 +169,85 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
         }
     })
 }
+pub fn shutdown(id: u32) -> bool {
+    let runtime_manager = match RUNTIME_CONTROLLER.lock() {
+        Ok(runtime_manager) => runtime_manager,
+        Err(_) => {
+            return false;
+        }
+    };
 
-pub fn shutdown() -> bool {
-    let mut rt_ctrl = RUNTIME_CONTROLLER.lock().unwrap();
-    if rt_ctrl
-        .runtime_counter
-        .load(std::sync::atomic::Ordering::SeqCst)
-        == 0
-    {
-        return false; // No runtime to shut down
+    let session = match runtime_manager.get(&id) {
+        Some(value) => value,
+        None => {
+            return false;
+        }
+    };
+    match session.shutdown_tx.blocking_send(()) {
+        Ok(_) => true,
+        Err(_) => false,
     }
-    rt_ctrl.shutdown_txs.clear();
-    true
 }
+// pub fn shutdown(id:u32) -> bool {
+//
+//     let runtime_manager = match RUNTIME_CONTROLLER.lock() {
+//         Ok(runtime_manager) => runtime_manager,
+//         Err(_) => {
+//             return false;
+//         }
+//     };
+//
+//     let session = match runtime_manager.get(&id) {
+//         Some(value) => value,
+//         None => {
+//             return false;
+//         }
+//     };
+//    return  match session.shutdown_tx.blocking_send(()) {
+//         Ok(_) => true,
+//         Err(_) => false,
+//     };
+//     //
+//     // let mut runtime_manager = match RUNTIME_CONTROLLER.lock() {
+//     //     Ok(runtime_manager) => runtime_manager,
+//     //     Err(_) => {
+//     //         return false;
+//     //     }
+//     // };
+//     //
+//     // let session = match runtime_manager.get_mut(&id) {
+//     //     Some(value) => value,
+//     //     None => {
+//     //         return false;
+//     //     }
+//     // };
+//     //
+//     // if session
+//     //     .runtime_counter
+//     //     .load(std::sync::atomic::Ordering::SeqCst)
+//     //     == 0
+//     // {
+//     //     return false; // No runtime to shut down
+//     // }
+//     // session.shutdown_txs.clear();
+//     return true;
+//     // // match session.shutdown_tx.blocking_send(()) {
+//     // //     Ok(_) => true,
+//     // //     Err(_) => false,
+//     // // }
+//     //
+//     //
+//     // let mut rt_ctrl = RUNTIME_CONTROLLER.lock().unwrap();
+//     // if rt_ctrl
+//     //     .runtime_counter
+//     //     .load(std::sync::atomic::Ordering::SeqCst)
+//     //     == 0
+//     // {
+//     //     return false; // No runtime to shut down
+//     // }
+//     // session.shutdown_txs.clear();
+//     // true
+// }
 
 static CRYPTO_PROVIDER_LOCK: OnceLock<()> = OnceLock::new();
 
@@ -220,22 +268,29 @@ pub fn setup_default_crypto_provider() {
     });
 }
 pub async fn start(
+    id:u32,
     config: InternalConfig,
     cwd: String,
     log_tx: broadcast::Sender<LogEvent>,
 ) -> Result<()> {
+
     setup_default_crypto_provider();
 
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
-
+    let (shutdown_tx, mut shutdown_rx)  = mpsc::channel(1);
     {
-        let mut rt_ctrl = RUNTIME_CONTROLLER.lock().unwrap();
-        rt_ctrl.register_runtime(shutdown_tx);
+        let mut runtime_manager = match RUNTIME_CONTROLLER.lock() {
+            Ok(runtime_manager) => runtime_manager,
+            Err(_) => {
+                return Err(Error::Operation("runtime manager lock error".to_string()));
+            }
+        };
+        let session = RuntimeController { shutdown_tx:Arc::new(shutdown_tx) };
+        runtime_manager.insert(id, session);
     }
-
+    //
     let mut tasks = Vec::<Runner>::new();
     let mut runners = Vec::new();
-
+    //
     let cwd = PathBuf::from(cwd);
 
     // things we need to clone before consuming config
@@ -374,7 +429,6 @@ pub async fn start(
         }
         Ok(())
     }));
-
     futures::future::select_all(tasks).await.0.map_err(|x| {
         error!("runtime error: {}, shutting down", x);
         x
@@ -399,6 +453,7 @@ async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
 ) -> Result<RuntimeComponents> {
+
     if config.tun.enable {
         debug!("tun enabled, initializing default outbound interface");
         init_net_config(config.tun.so_mark).await;
@@ -448,21 +503,14 @@ async fn create_components(
         debug!("country mmdb not set, skipping");
         None
     };
-
     debug!("initializing dns resolver");
     // Clone the dns.listen for the DNS Server later before we consume the config
     // TODO: we should separate the DNS resolver and DNS server config here
     let dns_listen = config.dns.listen.clone();
-    let plain_outbounds_map = HashMap::<String, Arc<dyn OutboundHandler>>::from_iter(
-        plain_outbounds
-            .iter()
-            .map(|x| (x.name().to_string(), x.clone())),
-    );
     let dns_resolver = dns::new_resolver(
         config.dns,
         Some(cache_store.clone()),
         country_mmdb.clone(),
-        plain_outbounds_map,
     )
     .await;
 
@@ -504,7 +552,6 @@ async fn create_components(
         debug!("geosite not set, skipping");
         None
     };
-
     debug!("initializing country asn mmdb");
     let asn_mmdb = if let Some(asn_mmdb_name) = config.general.asn_mmdb {
         Some(Arc::new(
@@ -522,7 +569,6 @@ async fn create_components(
         debug!("ASN mmdb not found and not configured for download, skipping");
         None
     };
-
     debug!("initializing router");
     let router = Arc::new(
         Router::new(
@@ -603,13 +649,10 @@ mod tests {
         socks-port: 7891
         bind-address: 127.0.0.1
         mmdb: "tests/data/Country.mmdb"
-        proxies:
-          - {name: DIRECT_alias, type: direct}
-          - {name: REJECT_alias, type: reject}
         "#;
 
         let handle = thread::spawn(|| {
-            start_scaffold(Options {
+            start_scaffold(1,Options {
                 config: Config::Str(conf.to_string()),
                 cwd: None,
                 rt: None,
@@ -620,7 +663,7 @@ mod tests {
 
         thread::spawn(|| {
             thread::sleep(Duration::from_secs(3));
-            assert!(shutdown());
+            assert!(shutdown(1));
         });
 
         handle.join().unwrap();

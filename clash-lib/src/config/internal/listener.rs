@@ -16,14 +16,12 @@ pub enum InboundOpts {
     Socks {
         #[serde(flatten)]
         common_opts: CommonInboundOpts,
-        #[serde(default = "default_bool_true")]
         udp: bool,
     },
     #[serde(alias = "mixed")]
     Mixed {
         #[serde(flatten)]
         common_opts: CommonInboundOpts,
-        #[serde(default = "default_bool_true")]
         udp: bool, // TODO users
     },
     #[cfg(feature = "tproxy")]
@@ -31,7 +29,6 @@ pub enum InboundOpts {
     TProxy {
         #[serde(flatten)]
         common_opts: CommonInboundOpts,
-        #[serde(default = "default_bool_true")]
         udp: bool,
     },
     #[cfg(feature = "redir")]

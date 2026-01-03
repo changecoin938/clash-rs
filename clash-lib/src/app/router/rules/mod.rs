@@ -12,7 +12,6 @@ pub mod final_;
 pub mod geodata;
 pub mod geoip;
 pub mod ipcidr;
-pub mod network;
 pub mod port;
 pub mod process;
 pub mod ruleset;

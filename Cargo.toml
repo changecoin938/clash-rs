@@ -10,9 +10,15 @@ members = [
     "clash-netstack"
 ]
 
+default-members = ["clash-bin"]
+
+
+[profile.dev]
+opt-level = 0
+debug = true
 
 [workspace.package]
-version = "0.9.3"
+version = "0.9.0"
 repository = "https://github.com/Watfaq/clash-rs.git"
 edition = "2024"
 authors = ["https://github.com/Watfaq/clash-rs/graphs/contributors"]

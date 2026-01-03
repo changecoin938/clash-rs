@@ -8,6 +8,7 @@ use crate::{
     },
 };
 use tracing::warn;
+use crate::proxy::transport::TcpHttpClient;
 
 impl TryFrom<OutboundVless> for Handler {
     type Error = crate::Error;
@@ -43,6 +44,18 @@ impl TryFrom<&OutboundVless> for Handler {
                 .network
                 .clone()
                 .map(|x| match x.as_str() {
+                    "tcp_http" => s
+                        .tcp_http_opts
+                        .as_ref()
+                        .map(|x| {
+                            let client: TcpHttpClient = (x, &s.common_opts)
+                                .try_into()
+                                .expect("invalid tcp_http options");
+                            Box::new(client) as _
+                        })
+                        .ok_or(Error::InvalidConfig(
+                            "tcp-http-opts is required for tcp_http".to_owned(),
+                        )),
                     "ws" => s
                         .ws_opts
                         .as_ref()
@@ -104,6 +117,7 @@ impl TryFrom<&OutboundVless> for Handler {
                         s.network
                             .as_ref()
                             .map(|x| match x.as_str() {
+                                "tcp_http" => Ok(vec!["http/1.1".to_owned()]),
                                 "ws" => Ok(vec!["http/1.1".to_owned()]),
                                 "http" => Ok(vec![]),
                                 "h2" | "grpc" => Ok(vec!["h2".to_owned()]),

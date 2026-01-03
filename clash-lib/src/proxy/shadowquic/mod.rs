@@ -88,17 +88,12 @@ impl Handler {
                     }
                     SocksAddr::Ip(socket_addr) => socket_addr,
                 };
-                let bind_addr = if addr.is_ipv4() {
-                    "0.0.0.0:0".parse().unwrap()
-                } else {
-                    "[::]:0".parse().unwrap()
-                };
                 let socket = new_udp_socket(
-                    Some(bind_addr),
+                    None,
                     sess.iface.as_ref(),
                     #[cfg(target_os = "linux")]
                     sess.so_mark,
-                    Some(bind_addr),
+                    Some(addr),
                 )
                 .await?;
 

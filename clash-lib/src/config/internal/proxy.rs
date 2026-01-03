@@ -49,10 +49,10 @@ pub fn map_serde_error(
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum OutboundProxyProtocol {
-    #[serde(rename = "direct")]
-    Direct(OutboundDirect),
-    #[serde(rename = "reject")]
-    Reject(OutboundReject),
+    #[serde(skip)]
+    Direct,
+    #[serde(skip)]
+    Reject,
     #[cfg(feature = "shadowsocks")]
     #[serde(rename = "ss")]
     Ss(OutboundShadowsocks),
@@ -86,8 +86,8 @@ pub enum OutboundProxyProtocol {
 impl OutboundProxyProtocol {
     fn name(&self) -> &str {
         match &self {
-            OutboundProxyProtocol::Direct(direct) => &direct.name,
-            OutboundProxyProtocol::Reject(reject) => &reject.name,
+            OutboundProxyProtocol::Direct => PROXY_DIRECT,
+            OutboundProxyProtocol::Reject => PROXY_REJECT,
             #[cfg(feature = "shadowsocks")]
             OutboundProxyProtocol::Ss(ss) => &ss.common_opts.name,
             OutboundProxyProtocol::Socks5(socks5) => &socks5.common_opts.name,
@@ -133,8 +133,8 @@ impl Display for OutboundProxyProtocol {
             #[cfg(feature = "shadowsocks")]
             OutboundProxyProtocol::Ss(_) => write!(f, "Shadowsocks"),
             OutboundProxyProtocol::Socks5(_) => write!(f, "Socks5"),
-            OutboundProxyProtocol::Direct(_) => write!(f, "{PROXY_DIRECT}"),
-            OutboundProxyProtocol::Reject(_) => write!(f, "{PROXY_REJECT}"),
+            OutboundProxyProtocol::Direct => write!(f, "{PROXY_DIRECT}"),
+            OutboundProxyProtocol::Reject => write!(f, "{PROXY_REJECT}"),
             OutboundProxyProtocol::Trojan(_) => write!(f, "Trojan"),
             OutboundProxyProtocol::Vmess(_) => write!(f, "Vmess"),
             OutboundProxyProtocol::Vless(_) => write!(f, "Vless"),
@@ -169,18 +169,6 @@ pub struct CommonConfigOptions {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
-pub struct OutboundDirect {
-    pub name: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
-#[serde(rename_all = "kebab-case")]
-pub struct OutboundReject {
-    pub name: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
-#[serde(rename_all = "kebab-case")]
 pub struct OutboundShadowsocks {
     #[serde(flatten)]
     pub common_opts: CommonConfigOptions,
@@ -190,6 +178,15 @@ pub struct OutboundShadowsocks {
     pub udp: bool,
     pub plugin: Option<String>,
     pub plugin_opts: Option<HashMap<String, serde_yaml::Value>>,
+    pub network: Option<String>,
+    pub ws_opts: Option<WsOpt>,
+    pub h2_opts: Option<H2Opt>,
+    pub grpc_opts: Option<GrpcOpt>,
+    pub tcp_http_opts: Option<TcpHttpOpt>,
+    pub tls: Option<bool>,
+    pub skip_cert_verify: Option<bool>,
+    #[serde(alias = "servername")]
+    pub server_name: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -222,7 +219,11 @@ pub struct H2Opt {
     pub host: Option<Vec<String>>,
     pub path: Option<String>,
 }
-
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+pub struct TcpHttpOpt {
+    pub host: Option<String>,
+    pub path: Option<String>,
+}
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct GrpcOpt {
@@ -242,6 +243,7 @@ pub struct OutboundTrojan {
     pub network: Option<String>,
     pub grpc_opts: Option<GrpcOpt>,
     pub ws_opts: Option<WsOpt>,
+    pub tcp_http_opts: Option<TcpHttpOpt>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -262,6 +264,7 @@ pub struct OutboundVmess {
     pub ws_opts: Option<WsOpt>,
     pub h2_opts: Option<H2Opt>,
     pub grpc_opts: Option<GrpcOpt>,
+    pub tcp_http_opts: Option<TcpHttpOpt>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -279,9 +282,9 @@ pub struct OutboundVless {
     pub ws_opts: Option<WsOpt>,
     pub h2_opts: Option<H2Opt>,
     pub grpc_opts: Option<GrpcOpt>,
+    pub tcp_http_opts: Option<TcpHttpOpt>,
 }
 
-#[cfg(feature = "wireguard")]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundWireguard {
@@ -300,7 +303,6 @@ pub struct OutboundWireguard {
     pub reserved_bits: Option<Vec<u8>>,
 }
 
-#[cfg(feature = "onion")]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundTor {

@@ -4,6 +4,8 @@ use crate::{
     config::proxy::{CommonConfigOptions, GrpcOpt, H2Opt, WsOpt},
     proxy::transport::{self, GrpcClient, H2Client, WsClient},
 };
+use crate::config::proxy::TcpHttpOpt;
+use crate::proxy::transport::TcpHttpClient;
 
 impl TryFrom<(&WsOpt, &CommonConfigOptions)> for WsClient {
     type Error = std::io::Error;
@@ -67,6 +69,25 @@ impl TryFrom<(&H2Opt, &CommonConfigOptions)> for H2Client {
             host,
             std::collections::HashMap::new(),
             http::Method::GET,
+            path.try_into()?,
+        ))
+    }
+}
+
+impl TryFrom<(&TcpHttpOpt, &CommonConfigOptions)> for TcpHttpClient {
+    type Error = InvalidUri;
+
+    fn try_from(pair: (&TcpHttpOpt, &CommonConfigOptions)) -> Result<Self, Self::Error> {
+        let (x, common) = pair;
+        let host = x
+            .host
+            .as_ref()
+            .map(|x| x.to_owned())
+            .unwrap_or(common.server.to_owned());
+        let path = x.path.as_ref().map(|x| x.to_owned()).unwrap_or_default();
+
+        Ok(TcpHttpClient::new(
+            host,
             path.try_into()?,
         ))
     }

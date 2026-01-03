@@ -142,7 +142,6 @@ impl InboundHandlerTrait for TproxyInbound {
 
         handle_inbound_datagram(
             self.allow_lan,
-            self.fw_mark,
             Arc::new(listener),
             self.dispatcher.clone(),
         )
@@ -172,7 +171,6 @@ fn bind_nonlocal_socket(src_addr: SocketAddr) -> io::Result<UdpSocket> {
 
 async fn handle_inbound_datagram(
     _allow_lan: bool,
-    fw_mark: Option<u32>,
     socket: Arc<unix_udp_sock::UdpSocket>,
     dispatcher: Arc<Dispatcher>,
 ) -> std::io::Result<()> {
@@ -190,7 +188,6 @@ async fn handle_inbound_datagram(
     let sess = Session {
         network: Network::Udp,
         typ: Type::Tproxy,
-        so_mark: fw_mark,
         ..Default::default()
     };
 

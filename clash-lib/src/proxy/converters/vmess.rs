@@ -9,6 +9,7 @@ use crate::{
         vmess::{Handler, HandlerOptions},
     },
 };
+use crate::proxy::transport::TcpHttpClient;
 
 impl TryFrom<OutboundVmess> for Handler {
     type Error = crate::Error;
@@ -46,6 +47,18 @@ impl TryFrom<&OutboundVmess> for Handler {
                 .network
                 .clone()
                 .map(|x| match x.as_str() {
+                    "tcp_http" => s
+                        .tcp_http_opts
+                        .as_ref()
+                        .map(|x| {
+                            let client: TcpHttpClient = (x, &s.common_opts)
+                                .try_into()
+                                .expect("invalid tcp_http options");
+                            Box::new(client) as _
+                        })
+                        .ok_or(Error::InvalidConfig(
+                            "tcp-http-opts is required for tcp_http".to_owned(),
+                        )),
                     "ws" => s
                         .ws_opts
                         .as_ref()
@@ -88,37 +101,39 @@ impl TryFrom<&OutboundVmess> for Handler {
                     ))),
                 })
                 .transpose()?,
-            tls: if s.tls.unwrap_or_default() {
-                let client = TlsClient::new(
-                    s.skip_cert_verify.unwrap_or_default(),
-                    s.server_name.as_ref().map(|x| x.to_owned()).unwrap_or(
-                        s.ws_opts
-                            .as_ref()
-                            .and_then(|x| {
-                                x.headers.clone().and_then(|x| {
-                                    let h = x.get("Host");
-                                    h.cloned()
+            tls: match s.tls.unwrap_or_default() {
+                true => {
+                    let client = TlsClient::new(
+                        s.skip_cert_verify.unwrap_or_default(),
+                        s.server_name.as_ref().map(|x| x.to_owned()).unwrap_or(
+                            s.ws_opts
+                                .as_ref()
+                                .and_then(|x| {
+                                    x.headers.clone().and_then(|x| {
+                                        let h = x.get("Host");
+                                        h.cloned()
+                                    })
                                 })
+                                .unwrap_or(s.common_opts.server.to_owned())
+                                .to_owned(),
+                        ),
+                        s.network
+                            .as_ref()
+                            .map(|x| match x.as_str() {
+                                "tcp_http" => Ok(vec!["http/1.1".to_owned()]),
+                                "ws" => Ok(vec!["http/1.1".to_owned()]),
+                                "http" => Ok(vec![]),
+                                "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
+                                _ => Err(Error::InvalidConfig(format!(
+                                    "unsupported network: {x}"
+                                ))),
                             })
-                            .unwrap_or(s.common_opts.server.to_owned())
-                            .to_owned(),
-                    ),
-                    s.network
-                        .as_ref()
-                        .map(|x| match x.as_str() {
-                            "ws" => Ok(vec!["http/1.1".to_owned()]),
-                            "http" => Ok(vec![]),
-                            "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
-                            _ => Err(Error::InvalidConfig(format!(
-                                "unsupported network: {x}"
-                            ))),
-                        })
-                        .transpose()?,
-                    None,
-                );
-                Some(Box::new(client))
-            } else {
-                None
+                            .transpose()?,
+                        None,
+                    );
+                    Some(Box::new(client))
+                }
+                false => None,
             },
         });
         Ok(h)

@@ -34,13 +34,12 @@ rustls = { version = "0.23", default-features = false }
 rustls-pemfile = "2"
 webpki-roots = "1.0"
 
-hickory-client = { version = "0.25", default-features = false }
-hickory-server = { version = "0.25", default-features = false }
-hickory-proto = { version = "0.25", default-features = false }
+hickory-client = { version = "0.25.2" }
+hickory-server = { version = "0.25.2", default-features = false }
+hickory-proto = { version = "0.25.2", default-features = false}
 
 
 
 [dev-dependencies]
-mockall = "0.14.0"
+mockall = "0.13.0"
 env_logger = "0.11"
-anyhow = "1"

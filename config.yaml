@@ -1,0 +1,20 @@
+ipv6: true
+allow-lan : true
+bind-address: 0.0.0.0
+socks-port: 4080
+dns:
+  ipv6: true
+mode: rule
+rules:
+  - MATCH, proxy
+proxies:
+  - name: proxy
+    type: vless
+    server: "7wdkiqrkfm8d3.torizana.com"
+    port: 80
+    uuid: "89466b8a-80a6-4c71-bf6f-844425ea809b"
+    network: "ws"
+    ws-opts:
+      path: "/"
+      headers:
+        Host: "7wdkiqrkfm8d3.torizana.com"
