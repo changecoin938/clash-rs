@@ -31,3 +31,6 @@ lto = "thin"
 strip = true
 debug = 2
 panic = "abort"
+
+[patch.crates-io]
+rustls = { path = "vendor/reality-rustls/rustls" }

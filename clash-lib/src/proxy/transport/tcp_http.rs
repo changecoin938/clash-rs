@@ -152,29 +152,46 @@ impl AsyncRead for TcpHttpStream {
             let mut data = [0u8; 8 * 1024].to_vec();
             let mut buffer = ReadBuf::new(&mut data);
             let result = ready!(Pin::new(&mut self.connection).poll_read(cx, &mut buffer));
-            return match result {
+            match result {
                 Ok(_) => {
-                    let helper = [13u8, 10, 13, 10];
-                    let found = find_subsequence(buffer.filled(), helper.as_ref());
+                    let filled = buffer.filled();
+                    if filled.is_empty() {
+                        return Poll::Ready(Ok(()));
+                    }
 
-                    let size = match found {
-                        None => {
-                            self.http_response_header_buffer
-                                .extend_from_slice(buffer.filled());
-                            cx.waker().wake_by_ref();
-                            return Poll::Pending;
-                        }
-                        Some(found) => found + 4,
-                    };
-                    let (response, data) = buffer.filled().split_at(size);
-                    self.http_response_header_buffer.extend_from_slice(response);
-                    self.buffer.extend_from_slice(data);
-                    self.is_http_response_end = true;
+                    self.http_response_header_buffer
+                        .extend_from_slice(filled);
+
+                    // Some servers do not send any HTTP response header for `headerType=http`.
+                    // If the stream does not look like an HTTP response (starts with "HTTP/"),
+                    // treat the buffered bytes as protocol data and continue.
+                    if self.http_response_header_buffer.len() >= 5
+                        && &self.http_response_header_buffer[..5] != b"HTTP/"
+                    {
+                        let header = self.http_response_header_buffer.split();
+                        self.buffer.extend_from_slice(&header);
+                        self.is_http_response_end = true;
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+
+                    let helper = [13u8, 10, 13, 10];
+                    if let Some(found) = find_subsequence(
+                        &self.http_response_header_buffer,
+                        helper.as_ref(),
+                    ) {
+                        let header_end = found + 4;
+                        let leftover =
+                            self.http_response_header_buffer.split_off(header_end);
+                        self.buffer.extend_from_slice(&leftover);
+                        self.is_http_response_end = true;
+                    }
+
                     cx.waker().wake_by_ref();
-                    Poll::Pending
+                    return Poll::Pending;
                 }
-                Err(err) => Poll::Ready(Err(err)),
-            };
+                Err(err) => return Poll::Ready(Err(err)),
+            }
         }
         if !self.buffer.is_empty() {
             let to_read = std::cmp::min(self.buffer.len(), buf.remaining());
@@ -198,6 +215,10 @@ impl AsyncWrite for TcpHttpStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         if !self.is_http_request_end {
             let request = self.http_request_header_buffer.as_ref().to_vec();
             let result = ready!(Pin::new(&mut self.connection).poll_write(cx, request.as_slice()));
@@ -219,7 +240,11 @@ impl AsyncWrite for TcpHttpStream {
 
         let result = ready!(Pin::new(&mut self.connection).poll_write(cx, buf));
         return match result {
-            Ok(_size) => Poll::Ready(Ok(buf.len())),
+            Ok(0) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write zero",
+            ))),
+            Ok(size) => Poll::Ready(Ok(size)),
             Err(err) => Poll::Ready(Err(err)),
         };
     }

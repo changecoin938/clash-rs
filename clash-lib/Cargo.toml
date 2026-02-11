@@ -112,8 +112,10 @@ chacha20poly1305 = "0.10"
 aead = { version = "0.5", features = ["std"] }
 aes = "0.8"
 aes-gcm = "0.10"
+blake3 = "1"
 cfb-mode = "0.8"
 const-fnv1a-hash = "1"
+ctr = "0.9"
 
 filetime = "0.2"
 axum = { version = "0.8", features = ["ws"] }
@@ -204,6 +206,7 @@ httpmock = "0.7.0"
 
 [build-dependencies]
 prost-build = "0.14"
+protoc-bin-vendored = "3.2.0"
 
 [target.'cfg(target_os="linux")'.dependencies]
 unix-udp-sock = { git = "https://github.com/Watfaq/unix-udp-sock.git", rev = "847c80b519f0fd8cff5c887ae708429897d08671" }

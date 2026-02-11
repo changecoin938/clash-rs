@@ -226,6 +226,21 @@ pub struct TcpHttpOpt {
 }
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
+pub struct RealityOpt {
+    pub public_key: Option<String>,
+    pub short_id: Option<String>,
+    pub spider_x: Option<String>,
+}
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct XHttpOpt {
+    pub host: Option<String>,
+    pub path: Option<String>,
+    pub mode: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+}
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
 pub struct GrpcOpt {
     pub grpc_service_name: Option<String>,
 }
@@ -244,6 +259,9 @@ pub struct OutboundTrojan {
     pub grpc_opts: Option<GrpcOpt>,
     pub ws_opts: Option<WsOpt>,
     pub tcp_http_opts: Option<TcpHttpOpt>,
+    pub reality_opts: Option<RealityOpt>,
+    #[serde(alias = "client-fingerprint")]
+    pub client_fingerprint: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -265,6 +283,10 @@ pub struct OutboundVmess {
     pub h2_opts: Option<H2Opt>,
     pub grpc_opts: Option<GrpcOpt>,
     pub tcp_http_opts: Option<TcpHttpOpt>,
+    pub xhttp_opts: Option<XHttpOpt>,
+    pub reality_opts: Option<RealityOpt>,
+    #[serde(alias = "client-fingerprint")]
+    pub client_fingerprint: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -273,6 +295,7 @@ pub struct OutboundVless {
     #[serde(flatten)]
     pub common_opts: CommonConfigOptions,
     pub uuid: String,
+    pub encryption: Option<String>,
     pub udp: Option<bool>,
     pub tls: Option<bool>,
     pub skip_cert_verify: Option<bool>,
@@ -283,6 +306,10 @@ pub struct OutboundVless {
     pub h2_opts: Option<H2Opt>,
     pub grpc_opts: Option<GrpcOpt>,
     pub tcp_http_opts: Option<TcpHttpOpt>,
+    pub xhttp_opts: Option<XHttpOpt>,
+    pub reality_opts: Option<RealityOpt>,
+    #[serde(alias = "client-fingerprint")]
+    pub client_fingerprint: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]

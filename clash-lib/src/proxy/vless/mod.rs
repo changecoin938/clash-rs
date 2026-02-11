@@ -33,6 +33,7 @@ pub struct HandlerOptions {
     pub udp: bool,
     pub transport: Option<Box<dyn Transport>>,
     pub tls: Option<Box<dyn Transport>>,
+    pub vless_encryption: Option<Box<dyn Transport>>,
 }
 
 pub struct Handler {
@@ -72,6 +73,12 @@ impl Handler {
 
         let s = if let Some(transport) = self.opts.transport.as_ref() {
             transport.proxy_stream(s).await?
+        } else {
+            s
+        };
+
+        let s = if let Some(enc) = self.opts.vless_encryption.as_ref() {
+            enc.proxy_stream(s).await?
         } else {
             s
         };

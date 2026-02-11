@@ -1,0 +1,12 @@
+# Rust
+/target/
+
+# macOS metadata
+.DS_Store
+._*
+
+# Rust compiler crash reports
+rustc-ice-*.txt
+
+# Local assistant tooling
+.claude/

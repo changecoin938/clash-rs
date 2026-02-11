@@ -1,8 +1,8 @@
 use http::uri::InvalidUri;
 
 use crate::{
-    config::proxy::{CommonConfigOptions, GrpcOpt, H2Opt, WsOpt},
-    proxy::transport::{self, GrpcClient, H2Client, WsClient},
+    config::proxy::{CommonConfigOptions, GrpcOpt, H2Opt, WsOpt, XHttpOpt},
+    proxy::transport::{self, GrpcClient, H2Client, WsClient, XHttpClient},
 };
 use crate::config::proxy::TcpHttpOpt;
 use crate::proxy::transport::TcpHttpClient;
@@ -83,6 +83,7 @@ impl TryFrom<(&TcpHttpOpt, &CommonConfigOptions)> for TcpHttpClient {
             .host
             .as_ref()
             .map(|x| x.to_owned())
+            .filter(|x| !x.is_empty())
             .unwrap_or(common.server.to_owned());
         let path = x.path.as_ref().map(|x| x.to_owned()).unwrap_or_default();
 
@@ -90,5 +91,78 @@ impl TryFrom<(&TcpHttpOpt, &CommonConfigOptions)> for TcpHttpClient {
             host,
             path.try_into()?,
         ))
+    }
+}
+
+impl TryFrom<(Option<String>, &XHttpOpt, &CommonConfigOptions)> for XHttpClient {
+    type Error = InvalidUri;
+
+    fn try_from(
+        opt: (Option<String>, &XHttpOpt, &CommonConfigOptions),
+    ) -> Result<Self, Self::Error> {
+        let (sni, x, common) = opt;
+        let host = x
+            .host
+            .as_ref()
+            .map(|x| x.to_owned())
+            .filter(|x| !x.is_empty())
+            .or(sni)
+            .unwrap_or(common.server.to_owned());
+        let path = normalize_xhttp_path_and_query(
+            x.path.as_ref().map(|x| x.as_str()).unwrap_or_default(),
+        );
+        let headers = x.headers.clone().unwrap_or_default();
+        Ok(XHttpClient::new(
+            host,
+            headers,
+            http::Method::POST,
+            path.try_into()?,
+        ))
+    }
+}
+
+fn normalize_xhttp_path_and_query(path_and_query: &str) -> String {
+    let (path, query) = path_and_query
+        .split_once('?')
+        .map(|(p, q)| (p, Some(q)))
+        .unwrap_or((path_and_query, None));
+
+    let mut normalized = if path.is_empty() {
+        "/".to_owned()
+    } else if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    };
+
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+
+    if let Some(query) = query {
+        normalized.push('?');
+        normalized.push_str(query);
+    }
+
+    normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_xhttp_path_and_query;
+
+    #[test]
+    fn normalize_xhttp_path_and_query_adds_slashes() {
+        assert_eq!(normalize_xhttp_path_and_query(""), "/");
+        assert_eq!(normalize_xhttp_path_and_query("abc"), "/abc/");
+        assert_eq!(normalize_xhttp_path_and_query("/abc"), "/abc/");
+        assert_eq!(normalize_xhttp_path_and_query("/"), "/");
+    }
+
+    #[test]
+    fn normalize_xhttp_path_and_query_preserves_query() {
+        assert_eq!(normalize_xhttp_path_and_query("abc?x=1"), "/abc/?x=1");
+        assert_eq!(normalize_xhttp_path_and_query("/abc?x=1"), "/abc/?x=1");
+        assert_eq!(normalize_xhttp_path_and_query("/abc/?x=1"), "/abc/?x=1");
     }
 }

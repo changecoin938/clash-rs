@@ -24,11 +24,19 @@ impl From<TLSOptions> for Client {
     }
 }
 
+#[derive(Serialize, Clone)]
+struct RealityOptions {
+    pub public_key: Vec<u8>,
+    pub short_id: Vec<u8>,
+    pub version: [u8; 3],
+}
+
 pub struct Client {
     pub skip_cert_verify: bool,
     pub sni: String,
     pub alpn: Option<Vec<String>>,
     pub expected_alpn: Option<String>,
+    reality: Option<RealityOptions>,
 }
 
 impl Client {
@@ -43,7 +51,21 @@ impl Client {
             sni,
             alpn,
             expected_alpn,
+            reality: None,
         }
+    }
+
+    pub fn enable_reality(
+        &mut self,
+        public_key: Vec<u8>,
+        short_id: Vec<u8>,
+        version: [u8; 3],
+    ) {
+        self.reality = Some(RealityOptions {
+            public_key,
+            short_id,
+            version,
+        });
     }
 }
 
@@ -61,9 +83,22 @@ impl Transport for Client {
             .map(|x| x.as_bytes().to_vec())
             .collect();
 
+        // REALITY uses a fake/self-issued certificate. We must not rely on WebPKI
+        // validation here (Xray uses InsecureSkipVerify + REALITY-specific auth).
+        let skip_cert_verify = self.skip_cert_verify || self.reality.is_some();
         tls_config.dangerous().set_certificate_verifier(Arc::new(
-            DefaultTlsVerifier::new(None, self.skip_cert_verify),
+            DefaultTlsVerifier::new(None, skip_cert_verify),
         ));
+
+        if let Some(reality) = self.reality.as_ref() {
+            tls_config.add_reality(
+                reality.public_key.clone(),
+                reality.short_id.clone(),
+                reality.version[0],
+                reality.version[1],
+                reality.version[2],
+            );
+        }
 
         if std::env::var("SSLKEYLOGFILE").is_ok() {
             tls_config.key_log = Arc::new(rustls::KeyLogFile::new());

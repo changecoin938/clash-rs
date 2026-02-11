@@ -255,15 +255,25 @@ pub fn setup_default_crypto_provider() {
     CRYPTO_PROVIDER_LOCK.get_or_init(|| {
         #[cfg(feature = "aws-lc-rs")]
         {
-            rustls::crypto::aws_lc_rs::default_provider()
-                .install_default()
-                .unwrap()
+            // Prefer classical KX groups first. Some REALITY targets reject
+            // X25519MLKEM768 and reply with HRR, which breaks some REALITY
+            // implementations and/or reveals a non-browser fingerprint.
+            let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+            provider.kx_groups = vec![
+                rustls::crypto::aws_lc_rs::kx_group::X25519,
+                rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+                rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+                rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+            ];
+            provider.install_default().unwrap();
+            return;
         }
         #[cfg(feature = "ring")]
         {
             rustls::crypto::ring::default_provider()
                 .install_default()
-                .unwrap()
+                .unwrap();
+            return;
         }
     });
 }
