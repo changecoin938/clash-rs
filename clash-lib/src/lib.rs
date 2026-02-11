@@ -1,0 +1,671 @@
+#![feature(cfg_version)]
+#![feature(ip)]
+#![feature(sync_unsafe_cell)]
+#![feature(let_chains)]
+#![feature(lazy_get)]
+#![feature(duration_millis_float)]
+#![cfg_attr(not(version("1.87.0")), feature(unbounded_shifts))]
+use once_cell::sync::{Lazy};
+use crate::{
+    app::{
+        dispatcher::Dispatcher, dns, inbound::manager::InboundManager,
+        outbound::manager::OutboundManager, router::Router,
+    },
+    common::{
+        geodata::{DEFAULT_GEOSITE_DOWNLOAD_URL, GeoDataLookup},
+        mmdb::{DEFAULT_ASN_MMDB_DOWNLOAD_URL, DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL},
+    },
+    config::{
+        def,
+        internal::{InternalConfig, proxy::OutboundProxy},
+    },
+};
+use app::{
+    dispatcher::StatisticsManager,
+    dns::{SystemResolver, ThreadSafeDNSResolver},
+    logging::LogEvent,
+    net::init_net_config,
+    profile,
+};
+use common::{auth, http::new_http_client, mmdb};
+use config::def::LogLevel;
+#[cfg(feature = "tun")]
+use proxy::tun::get_tun_runner;
+
+use std::{
+    collections::HashMap,
+    io,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
+
+use thiserror::Error;
+use tokio::{
+    sync::{Mutex, broadcast, mpsc, oneshot},
+    task::JoinHandle,
+};
+use tracing::{debug, error, info};
+
+mod app;
+mod common;
+#[cfg(feature = "internal")]
+pub mod config;
+#[cfg(not(feature = "internal"))]
+mod config;
+mod proxy;
+mod session;
+
+use crate::common::{geodata, mmdb::MmdbLookup};
+pub use config::{
+    DNSListen as ClashDNSListen, RuntimeConfig as ClashRuntimeConfig,
+    def::{Config as ClashConfigDef, DNS as ClashDNSConfigDef},
+};
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error(transparent)]
+    IpNet(#[from] ipnet::AddrParseError),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
+    #[error("profile error: {0}")]
+    ProfileError(String),
+    #[error("dns error: {0}")]
+    DNSError(String),
+    #[error(transparent)]
+    DNSServerError(#[from] watfaq_dns::DNSError),
+    #[error("crypto error: {0}")]
+    Crypto(String),
+    #[error("operation error: {0}")]
+    Operation(String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+pub type Result<T> = std::result::Result<T, Error>;
+pub type Runner = futures::future::BoxFuture<'static, Result<()>>;
+
+pub struct Options {
+    pub config: Config,
+    pub cwd: Option<String>,
+    pub rt: Option<TokioRuntime>,
+    pub log_file: Option<String>,
+}
+
+pub enum TokioRuntime {
+    MultiThread,
+    SingleThread,
+}
+
+#[allow(clippy::large_enum_variant)]
+pub enum Config {
+    Def(ClashConfigDef),
+    Internal(InternalConfig),
+    File(String),
+    Str(String),
+}
+
+impl Config {
+    pub fn try_parse(self) -> Result<InternalConfig> {
+        match self {
+            Config::Def(c) => c.try_into(),
+            Config::Internal(c) => Ok(c),
+            Config::File(file) => {
+                TryInto::<def::Config>::try_into(PathBuf::from(file))?.try_into()
+            }
+            Config::Str(s) => s.parse::<def::Config>()?.try_into(),
+        }
+    }
+}
+
+pub struct GlobalState {
+    log_level: LogLevel,
+    #[cfg(feature = "tun")]
+    tunnel_listener_handle: Option<JoinHandle<Result<()>>>,
+    api_listener_handle: Option<JoinHandle<Result<()>>>,
+    dns_listener_handle: Option<JoinHandle<Result<()>>>,
+    reload_tx: mpsc::Sender<(Config, oneshot::Sender<()>)>,
+    cwd: String,
+}
+
+pub struct RuntimeController {
+    shutdown_tx: Arc<mpsc::Sender<()>>,
+}
+
+
+// static RUNTIME_CONTROLLER: LazyLock<std::sync::Mutex<RuntimeController>> =
+//     LazyLock::new(|| std::sync::Mutex::new(RuntimeController::new()));
+static RUNTIME_CONTROLLER: Lazy<std::sync::Mutex<HashMap<u32, RuntimeController>>> = Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+pub fn start_scaffold(id:u32,opts: Options) -> Result<()> {
+    let rt = match opts.rt.as_ref().unwrap_or(&TokioRuntime::MultiThread) {
+        TokioRuntime::MultiThread => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?,
+        TokioRuntime::SingleThread => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?,
+    };
+    let config: InternalConfig = opts.config.try_parse()?;
+    let cwd = opts.cwd.unwrap_or_else(|| ".".to_string());
+    let (log_tx, _) = broadcast::channel(100);
+
+    let log_collector = app::logging::EventCollector::new(vec![log_tx.clone()]);
+
+    app::logging::setup_logging(
+        config.general.log_level,
+        log_collector,
+        &cwd,
+        opts.log_file,
+    );
+
+    rt.block_on(async {
+        match start(id,config, cwd, log_tx).await {
+            Err(e) => {
+                eprintln!("start error: {e}");
+                Err(e)
+            }
+            Ok(_) => Ok(()),
+        }
+    })
+}
+pub fn shutdown(id: u32) -> bool {
+    let runtime_manager = match RUNTIME_CONTROLLER.lock() {
+        Ok(runtime_manager) => runtime_manager,
+        Err(_) => {
+            return false;
+        }
+    };
+
+    let session = match runtime_manager.get(&id) {
+        Some(value) => value,
+        None => {
+            return false;
+        }
+    };
+    match session.shutdown_tx.blocking_send(()) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+// pub fn shutdown(id:u32) -> bool {
+//
+//     let runtime_manager = match RUNTIME_CONTROLLER.lock() {
+//         Ok(runtime_manager) => runtime_manager,
+//         Err(_) => {
+//             return false;
+//         }
+//     };
+//
+//     let session = match runtime_manager.get(&id) {
+//         Some(value) => value,
+//         None => {
+//             return false;
+//         }
+//     };
+//    return  match session.shutdown_tx.blocking_send(()) {
+//         Ok(_) => true,
+//         Err(_) => false,
+//     };
+//     //
+//     // let mut runtime_manager = match RUNTIME_CONTROLLER.lock() {
+//     //     Ok(runtime_manager) => runtime_manager,
+//     //     Err(_) => {
+//     //         return false;
+//     //     }
+//     // };
+//     //
+//     // let session = match runtime_manager.get_mut(&id) {
+//     //     Some(value) => value,
+//     //     None => {
+//     //         return false;
+//     //     }
+//     // };
+//     //
+//     // if session
+//     //     .runtime_counter
+//     //     .load(std::sync::atomic::Ordering::SeqCst)
+//     //     == 0
+//     // {
+//     //     return false; // No runtime to shut down
+//     // }
+//     // session.shutdown_txs.clear();
+//     return true;
+//     // // match session.shutdown_tx.blocking_send(()) {
+//     // //     Ok(_) => true,
+//     // //     Err(_) => false,
+//     // // }
+//     //
+//     //
+//     // let mut rt_ctrl = RUNTIME_CONTROLLER.lock().unwrap();
+//     // if rt_ctrl
+//     //     .runtime_counter
+//     //     .load(std::sync::atomic::Ordering::SeqCst)
+//     //     == 0
+//     // {
+//     //     return false; // No runtime to shut down
+//     // }
+//     // session.shutdown_txs.clear();
+//     // true
+// }
+
+static CRYPTO_PROVIDER_LOCK: OnceLock<()> = OnceLock::new();
+
+pub fn setup_default_crypto_provider() {
+    CRYPTO_PROVIDER_LOCK.get_or_init(|| {
+        #[cfg(feature = "aws-lc-rs")]
+        {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .install_default()
+                .unwrap()
+        }
+        #[cfg(feature = "ring")]
+        {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .unwrap()
+        }
+    });
+}
+pub async fn start(
+    id:u32,
+    config: InternalConfig,
+    cwd: String,
+    log_tx: broadcast::Sender<LogEvent>,
+) -> Result<()> {
+
+    setup_default_crypto_provider();
+
+    let (shutdown_tx, mut shutdown_rx)  = mpsc::channel(1);
+    {
+        let mut runtime_manager = match RUNTIME_CONTROLLER.lock() {
+            Ok(runtime_manager) => runtime_manager,
+            Err(_) => {
+                return Err(Error::Operation("runtime manager lock error".to_string()));
+            }
+        };
+        let session = RuntimeController { shutdown_tx:Arc::new(shutdown_tx) };
+        runtime_manager.insert(id, session);
+    }
+    //
+    let mut tasks = Vec::<Runner>::new();
+    let mut runners = Vec::new();
+    //
+    let cwd = PathBuf::from(cwd);
+
+    // things we need to clone before consuming config
+    let controller_cfg = config.general.controller.clone();
+    let log_level = config.general.log_level;
+
+    let components = create_components(cwd.clone(), config).await?;
+
+    let inbound_manager = components.inbound_manager.clone();
+    inbound_manager.start_all_listeners().await;
+
+    #[cfg(feature = "tun")]
+    let tun_runner_handle = components.tun_runner.map(tokio::spawn);
+    let dns_listener_handle = components.dns_listener.map(tokio::spawn);
+
+    let (reload_tx, mut reload_rx) = mpsc::channel(1);
+
+    let global_state = Arc::new(Mutex::new(GlobalState {
+        log_level,
+        #[cfg(feature = "tun")]
+        tunnel_listener_handle: tun_runner_handle,
+        dns_listener_handle,
+        reload_tx,
+        api_listener_handle: None,
+        cwd: cwd.to_string_lossy().to_string(),
+    }));
+
+    let api_runner = app::api::get_api_runner(
+        controller_cfg,
+        log_tx.clone(),
+        components.inbound_manager,
+        components.dispatcher,
+        global_state.clone(),
+        components.dns_resolver,
+        components.outbound_manager,
+        components.statistics_manager,
+        components.cache_store,
+        components.router,
+        cwd.to_string_lossy().to_string(),
+    );
+    if let Some(r) = api_runner {
+        let api_listener_handle = tokio::spawn(r);
+        global_state.lock().await.api_listener_handle = Some(api_listener_handle);
+    }
+
+    runners.push(Box::pin(async move {
+        match shutdown_rx.recv().await {
+            Some(_) => {
+                info!("received shutdown signal");
+                Ok(())
+            }
+            None => {
+                info!("runtime controller shutdown");
+                Ok(())
+            }
+        }
+    }));
+
+    tasks.push(Box::pin(async move {
+        futures::future::select_all(runners).await.0
+    }));
+
+    tasks.push(Box::pin(async move {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for ^C event");
+        Ok(())
+    }));
+
+    tasks.push(Box::pin(async move {
+        while let Some((config, done)) = reload_rx.recv().await {
+            info!("reloading config");
+            let config = match config.try_parse() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("failed to reload config: {}", e);
+                    continue;
+                }
+            };
+
+            let controller_cfg = config.general.controller.clone();
+
+            let new_components = create_components(cwd.clone(), config).await?;
+
+            done.send(()).unwrap();
+
+            debug!("stopping listeners");
+            inbound_manager.shutdown().await;
+            let mut g = global_state.lock().await;
+
+            #[cfg(feature = "tun")]
+            if let Some(h) = g.tunnel_listener_handle.take() {
+                h.abort();
+            }
+            if let Some(h) = g.dns_listener_handle.take() {
+                h.abort();
+            }
+            if let Some(h) = g.api_listener_handle.take() {
+                h.abort();
+            }
+
+            let inbound_manager = new_components.inbound_manager.clone();
+            debug!("reloading inbound listener");
+            inbound_manager.restart().await;
+
+            #[cfg(feature = "tun")]
+            debug!("reloading tun runner");
+            #[cfg(feature = "tun")]
+            let tun_runner_handle = new_components.tun_runner.map(tokio::spawn);
+
+            debug!("reloading dns listener");
+            let dns_listener_handle = new_components.dns_listener.map(tokio::spawn);
+
+            debug!("reloading api listener");
+            let api_listener_handle = app::api::get_api_runner(
+                controller_cfg,
+                log_tx.clone(),
+                new_components.inbound_manager,
+                new_components.dispatcher,
+                global_state.clone(),
+                new_components.dns_resolver,
+                new_components.outbound_manager,
+                new_components.statistics_manager,
+                new_components.cache_store,
+                new_components.router,
+                cwd.to_string_lossy().to_string(),
+            )
+            .map(tokio::spawn);
+
+            #[cfg(feature = "tun")]
+            {
+                g.tunnel_listener_handle = tun_runner_handle;
+            }
+            g.dns_listener_handle = dns_listener_handle;
+            g.api_listener_handle = api_listener_handle;
+        }
+        Ok(())
+    }));
+    futures::future::select_all(tasks).await.0.map_err(|x| {
+        error!("runtime error: {}, shutting down", x);
+        x
+    })
+}
+
+struct RuntimeComponents {
+    cache_store: profile::ThreadSafeCacheFile,
+    dns_resolver: ThreadSafeDNSResolver,
+    outbound_manager: Arc<OutboundManager>,
+    router: Arc<Router>,
+    dispatcher: Arc<Dispatcher>,
+    statistics_manager: Arc<StatisticsManager>,
+    inbound_manager: Arc<InboundManager>,
+
+    #[cfg(feature = "tun")]
+    tun_runner: Option<Runner>,
+    dns_listener: Option<Runner>,
+}
+
+async fn create_components(
+    cwd: PathBuf,
+    config: InternalConfig,
+) -> Result<RuntimeComponents> {
+
+    if config.tun.enable {
+        debug!("tun enabled, initializing default outbound interface");
+        init_net_config(config.tun.so_mark).await;
+    }
+
+    debug!("initializing cache store");
+    let cache_store = profile::ThreadSafeCacheFile::new(
+        cwd.join("cache.db").as_path().to_str().unwrap(),
+        config.profile.store_selected,
+    );
+
+    let system_resolver = Arc::new(
+        SystemResolver::new(config.dns.ipv6)
+            .map_err(|x| Error::DNSError(x.to_string()))?,
+    );
+
+    debug!("initializing bootstrap outbounds");
+    let plain_outbounds = OutboundManager::load_plain_outbounds(
+        config
+            .proxies
+            .into_values()
+            .filter_map(|x| match x {
+                OutboundProxy::ProxyServer(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+    );
+
+    let client =
+        new_http_client(system_resolver.clone(), Some(plain_outbounds.clone()))
+            .map_err(|x| Error::DNSError(x.to_string()))?;
+
+    debug!("initializing mmdb");
+    let country_mmdb = if let Some(country_mmdb_file) = config.general.mmdb {
+        Some(Arc::new(
+            mmdb::Mmdb::new(
+                cwd.join(&country_mmdb_file),
+                config
+                    .general
+                    .mmdb_download_url
+                    .unwrap_or(DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL.to_string()),
+                client.clone(),
+            )
+            .await?,
+        ) as MmdbLookup)
+    } else {
+        debug!("country mmdb not set, skipping");
+        None
+    };
+    debug!("initializing dns resolver");
+    // Clone the dns.listen for the DNS Server later before we consume the config
+    // TODO: we should separate the DNS resolver and DNS server config here
+    let dns_listen = config.dns.listen.clone();
+    let dns_resolver = dns::new_resolver(
+        config.dns,
+        Some(cache_store.clone()),
+        country_mmdb.clone(),
+    )
+    .await;
+
+    debug!("initializing outbound manager");
+    let outbound_manager = Arc::new(
+        OutboundManager::new(
+            plain_outbounds,
+            config
+                .proxy_groups
+                .into_values()
+                .filter_map(|x| match x {
+                    OutboundProxy::ProxyGroup(g) => Some(g),
+                    _ => None,
+                })
+                .collect(),
+            config.proxy_providers,
+            config.proxy_names,
+            dns_resolver.clone(),
+            cache_store.clone(),
+            cwd.to_string_lossy().to_string(),
+        )
+        .await?,
+    );
+
+    debug!("initializing geosite");
+    let geodata = if let Some(geosite_file) = config.general.geosite {
+        Some(Arc::new(
+            geodata::GeoData::new(
+                cwd.join(&geosite_file),
+                config
+                    .general
+                    .geosite_download_url
+                    .unwrap_or(DEFAULT_GEOSITE_DOWNLOAD_URL.to_string()),
+                client.clone(),
+            )
+            .await?,
+        ) as GeoDataLookup)
+    } else {
+        debug!("geosite not set, skipping");
+        None
+    };
+    debug!("initializing country asn mmdb");
+    let asn_mmdb = if let Some(asn_mmdb_name) = config.general.asn_mmdb {
+        Some(Arc::new(
+            mmdb::Mmdb::new(
+                cwd.join(&asn_mmdb_name),
+                config
+                    .general
+                    .asn_mmdb_download_url
+                    .unwrap_or(DEFAULT_ASN_MMDB_DOWNLOAD_URL.to_string()),
+                client.clone(),
+            )
+            .await?,
+        ) as MmdbLookup)
+    } else {
+        debug!("ASN mmdb not found and not configured for download, skipping");
+        None
+    };
+    debug!("initializing router");
+    let router = Arc::new(
+        Router::new(
+            config.rules,
+            config.rule_providers,
+            dns_resolver.clone(),
+            country_mmdb,
+            asn_mmdb,
+            geodata,
+            cwd.to_string_lossy().to_string(),
+        )
+        .await,
+    );
+
+    let statistics_manager = StatisticsManager::new();
+
+    debug!("initializing dispatcher");
+    let dispatcher = Arc::new(Dispatcher::new(
+        outbound_manager.clone(),
+        router.clone(),
+        dns_resolver.clone(),
+        config.general.mode,
+        statistics_manager.clone(),
+        config.experimental.and_then(|e| e.tcp_buffer_size),
+    ));
+
+    debug!("initializing authenticator");
+    let authenticator = Arc::new(auth::PlainAuthenticator::new(config.users));
+
+    debug!("initializing inbound manager");
+    let inbound_manager = Arc::new(
+        InboundManager::new(dispatcher.clone(), authenticator, config.listeners)
+            .await,
+    );
+
+    #[cfg(feature = "tun")]
+    debug!("initializing tun runner");
+    #[cfg(feature = "tun")]
+    let tun_runner =
+        get_tun_runner(config.tun, dispatcher.clone(), dns_resolver.clone())?;
+
+    debug!("initializing dns listener");
+    let dns_listener =
+        dns::get_dns_listener(dns_listen, dns_resolver.clone(), &cwd).await;
+
+    info!("all components initialized");
+    Ok(RuntimeComponents {
+        cache_store,
+        dns_resolver,
+        outbound_manager,
+        router,
+        dispatcher,
+        statistics_manager,
+        inbound_manager,
+        #[cfg(feature = "tun")]
+        tun_runner,
+        dns_listener,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Config, Options, shutdown, start_scaffold};
+    use std::{sync::Once, thread, time::Duration};
+
+    static INIT: Once = Once::new();
+
+    pub fn initialize() {
+        INIT.call_once(|| {
+            env_logger::init();
+            crate::setup_default_crypto_provider();
+        });
+    }
+
+    #[test]
+    fn start_and_stop() {
+        let conf = r#"
+        socks-port: 7891
+        bind-address: 127.0.0.1
+        mmdb: "tests/data/Country.mmdb"
+        "#;
+
+        let handle = thread::spawn(|| {
+            start_scaffold(1,Options {
+                config: Config::Str(conf.to_string()),
+                cwd: None,
+                rt: None,
+                log_file: None,
+            })
+            .unwrap()
+        });
+
+        thread::spawn(|| {
+            thread::sleep(Duration::from_secs(3));
+            assert!(shutdown(1));
+        });
+
+        handle.join().unwrap();
+    }
+}
