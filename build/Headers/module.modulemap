@@ -1,0 +1,4 @@
+module clashrs {
+    umbrella header "clashrs.h"
+    export *
+}
