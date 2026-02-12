@@ -47,7 +47,7 @@ impl Client {
             .version(Version::HTTP_2)
             .header("content-type", "application/grpc")
             .header("user-agent", "tonic/0.10");
-        Ok(request.body(()).unwrap())
+        request.body(()).map_err(map_io_error)
     }
 }
 
@@ -174,7 +174,13 @@ impl AsyncRead for GrpcStream {
 
         let recv = self.recv.clone();
 
-        let mut recv = recv.try_lock().unwrap();
+        let mut recv = match recv.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        };
         if recv.is_none() {
             warn!("grpc initialization error");
             return Poll::Ready(Err(Error::new(

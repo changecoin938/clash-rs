@@ -658,7 +658,6 @@ mod tests {
         let conf = r#"
         socks-port: 7891
         bind-address: 127.0.0.1
-        mmdb: "tests/data/Country.mmdb"
         "#;
 
         let handle = thread::spawn(|| {

@@ -472,6 +472,7 @@ impl OutboundManager {
         fn make_provider_from_proxies(
             name: &str,
             proxies: &[String],
+            url: Option<&str>,
             interval: u64,
             lazy: bool,
             handlers: &HashMap<String, AnyOutboundHandler>,
@@ -495,9 +496,10 @@ impl OutboundManager {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
+            let url = url.filter(|x| !x.is_empty()).unwrap_or(DEFAULT_LATENCY_TEST_URL);
             let hc = HealthCheck::new(
                 proxies.clone(),
-                DEFAULT_LATENCY_TEST_URL.to_owned(),
+                url.to_owned(),
                 interval,
                 lazy,
                 proxy_manager.clone(),
@@ -559,6 +561,7 @@ impl OutboundManager {
                         providers.push(make_provider_from_proxies(
                             &proto.name,
                             proxies,
+                            proto.url.as_deref(),
                             0,
                             true,
                             handlers,
@@ -600,6 +603,7 @@ impl OutboundManager {
                         providers.push(make_provider_from_proxies(
                             &proto.name,
                             proxies,
+                            Some(proto.url.as_str()),
                             proto.interval,
                             proto.lazy.unwrap_or_default(),
                             handlers,
@@ -644,6 +648,7 @@ impl OutboundManager {
                         providers.push(make_provider_from_proxies(
                             &proto.name,
                             proxies,
+                            Some(proto.url.as_str()),
                             proto.interval,
                             proto.lazy.unwrap_or_default(),
                             handlers,
@@ -688,6 +693,7 @@ impl OutboundManager {
                         providers.push(make_provider_from_proxies(
                             &proto.name,
                             proxies,
+                            Some(proto.url.as_str()),
                             proto.interval,
                             proto.lazy.unwrap_or_default(),
                             handlers,
@@ -732,6 +738,7 @@ impl OutboundManager {
                         providers.push(make_provider_from_proxies(
                             &proto.name,
                             proxies,
+                            proto.url.as_deref(),
                             0,
                             true,
                             handlers,
@@ -781,6 +788,7 @@ impl OutboundManager {
                         providers.push(make_provider_from_proxies(
                             &proto.name,
                             proxies,
+                            proto.url.as_deref(),
                             0,
                             proto.lazy.unwrap_or_default(),
                             handlers,

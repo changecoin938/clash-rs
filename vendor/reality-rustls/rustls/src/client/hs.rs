@@ -9,7 +9,7 @@ use crate::check::inappropriate_handshake_message;
 use crate::client::client_conn::ClientConnectionData;
 use crate::client::common::ClientHelloDetails;
 use crate::client::ech::EchState;
-use crate::client::{ClientConfig, EchMode, EchStatus, tls13};
+use crate::client::{ClientConfig, ClientHelloFingerprint, EchMode, EchStatus, tls13};
 use crate::common_state::{CommonState, HandshakeKind, KxState, State};
 use crate::conn::ConnectionRandoms;
 use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
@@ -20,14 +20,14 @@ use crate::log::{debug, trace};
 use crate::msgs::base::Payload;
 use crate::msgs::codec::Codec;
 use crate::msgs::enums::{
-    CertificateType, Compression, ECPointFormat, ExtensionType, PskKeyExchangeMode,
+    CertificateType, Compression, ECPointFormat, ExtensionType, NamedGroup, PskKeyExchangeMode,
 };
 use crate::msgs::handshake::ProtocolName;
 use crate::msgs::handshake::SupportedProtocolVersions;
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtension, ClientHelloPayload, ClientSessionTicket,
     HandshakeMessagePayload, HandshakePayload, HasServerExtensions, HelloRetryRequest,
-    KeyShareEntry, Random, SessionId,
+    KeyShareEntry, Random, SessionId, UnknownExtension,
 };
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
@@ -49,6 +49,90 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
 pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
 pub(super) type ClientContext<'a> = crate::common_state::Context<'a, ClientConnectionData>;
+
+fn is_grease_value(v: u16) -> bool {
+    // <https://datatracker.ietf.org/doc/html/rfc8701#section-2>
+    (v & 0x0f0f) == 0x0a0a && (v >> 8) == (v & 0xff)
+}
+
+fn grease_value_from_seed(seed: u16, purpose: u16) -> u16 {
+    let input = ((seed as u32) << 16) | (purpose as u32);
+    let h = low_quality_integer_hash(input);
+    let nibble = (h & 0x0f) as u16;
+    (nibble << 12) | (nibble << 4) | 0x0a0a
+}
+
+fn make_unknown_extension(typ: ExtensionType, payload: Payload<'static>) -> ClientExtension {
+    ClientExtension::Unknown(UnknownExtension { typ, payload })
+}
+
+fn insert_before_ech_or_psk(exts: &mut Vec<ClientExtension>, ext: ClientExtension) {
+    let idx = exts
+        .iter()
+        .position(|e| matches!(e, ClientExtension::EncryptedClientHello(_) | ClientExtension::PresharedKey(..)))
+        .unwrap_or(exts.len());
+    exts.insert(idx, ext);
+}
+
+fn reorder_named_groups(groups: &mut Vec<NamedGroup>, preferred: &[NamedGroup]) {
+    let mut out = Vec::with_capacity(groups.len());
+    for p in preferred {
+        if let Some(idx) = groups
+            .iter()
+            .position(|g| u16::from(*g) == u16::from(*p))
+        {
+            out.push(groups.remove(idx));
+        }
+    }
+    out.append(groups);
+    *groups = out;
+}
+
+fn boring_padding_len(unpadded_len: usize) -> Option<usize> {
+    // BoringSSL style padding: pad ClientHello to 0x200 bytes if it's in (0x100, 0x200).
+    // <https://github.com/google/boringssl/blob/7d7554b6b3c79e707e25521e61e066ce2b996e4c/ssl/t1_lib.c#L2803>
+    if (0x100..0x200).contains(&unpadded_len) {
+        let mut padding_len = 0x200 - unpadded_len;
+        // Account for extension type + length overhead.
+        padding_len = match padding_len >= 4 + 1 {
+            true => padding_len - 4,
+            false => 1,
+        };
+        return Some(padding_len);
+    }
+
+    None
+}
+
+fn apply_boring_padding(chp: &mut ClientHelloPayload) {
+    let Some(padding_idx) = chp
+        .extensions
+        .iter()
+        .position(|e| e.ext_type() == ExtensionType::Padding)
+    else {
+        return;
+    };
+
+    let mut unpadded = chp.clone();
+    unpadded.extensions.remove(padding_idx);
+    let unpadded_msg = HandshakeMessagePayload {
+        typ: HandshakeType::ClientHello,
+        payload: HandshakePayload::ClientHello(unpadded),
+    };
+    let unpadded_len = unpadded_msg.get_encoding().len();
+
+    let Some(pad_len) = boring_padding_len(unpadded_len) else {
+        chp.extensions.remove(padding_idx);
+        return;
+    };
+
+    if let ClientExtension::Unknown(ext) = &mut chp.extensions[padding_idx] {
+        ext.payload = Payload::new(vec![0u8; pad_len]);
+    } else {
+        // Should be unreachable since we only add padding as UnknownExtension.
+        chp.extensions.remove(padding_idx);
+    }
+}
 
 fn find_session(
     server_name: &ServerName<'static>,
@@ -265,13 +349,45 @@ fn emit_client_hello_for_retry(
     assert!(supported_versions.any(|_| true));
 
     // offer groups which are usable for any offered version
-    let offered_groups = config
+    let mut offered_groups: Vec<NamedGroup> = config
         .provider
         .kx_groups
         .iter()
         .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
         .map(|skxg| skxg.name())
         .collect();
+    match config.client_hello_fingerprint {
+        ClientHelloFingerprint::Chrome | ClientHelloFingerprint::Safari => {
+            // Chrome-like stacks typically prefer X25519 then NIST curves, with GREASE first.
+            reorder_named_groups(
+                &mut offered_groups,
+                &[NamedGroup::X25519, NamedGroup::secp256r1, NamedGroup::secp384r1],
+            );
+            let grease = NamedGroup::Unknown(grease_value_from_seed(
+                input.hello.extension_order_seed,
+                0x100,
+            ));
+            if !offered_groups.iter().any(|g| match *g {
+                NamedGroup::Unknown(v) => is_grease_value(v),
+                _ => false,
+            }) {
+                offered_groups.insert(0, grease);
+            }
+        }
+        ClientHelloFingerprint::Firefox => {
+            // Firefox prefers X25519 and includes P-521.
+            reorder_named_groups(
+                &mut offered_groups,
+                &[
+                    NamedGroup::X25519,
+                    NamedGroup::secp256r1,
+                    NamedGroup::secp384r1,
+                    NamedGroup::secp521r1,
+                ],
+            );
+        }
+        _ => {}
+    }
 
     let mut exts = vec![
         ClientExtension::SupportedVersions(supported_versions),
@@ -383,7 +499,9 @@ fn emit_client_hello_for_retry(
     }
 
     // Add ALPN extension if we have any protocols
-    if !input.hello.alpn_protocols.is_empty() {
+    if !input.hello.alpn_protocols.is_empty()
+        && config.client_hello_fingerprint != ClientHelloFingerprint::RandomizedNoAlpn
+    {
         exts.push(ClientExtension::Protocols(
             input
                 .hello
@@ -441,26 +559,178 @@ fn emit_client_hello_for_retry(
     // Do we have a SessionID or ticket cached for this host?
     let tls13_session = prepare_resumption(&input.resuming, &mut exts, suite, cx, config);
 
-    // Extensions MAY be randomized
-    // but they also need to keep the same order as the previous ClientHello
-    exts.sort_by_cached_key(|new_ext| {
-        match (&cx.data.ech_status, new_ext) {
-            // When not offering ECH/GREASE, the PSK extension is always last.
-            (EchStatus::NotOffered, ClientExtension::PresharedKey(..)) => return u32::MAX,
-            // When ECH or GREASE are in-play, the ECH extension is always last.
-            (_, ClientExtension::EncryptedClientHello(_)) => return u32::MAX,
-            // ... and the PSK extension should be second-to-last.
-            (_, ClientExtension::PresharedKey(..)) => return u32::MAX - 1,
-            _ => {}
-        };
+    let fingerprint = config.client_hello_fingerprint;
 
-        let seed = ((input.hello.extension_order_seed as u32) << 16)
-            | (u16::from(new_ext.ext_type()) as u32);
-        match low_quality_integer_hash(seed) {
-            u32::MAX => 0,
-            key => key,
+    // Apply uTLS-like fingerprinting tweaks.
+    if fingerprint == ClientHelloFingerprint::Safari {
+        // Safari does not advertise session tickets in its ClientHello.
+        exts.retain(|e| e.ext_type() != ExtensionType::SessionTicket);
+    }
+
+    if matches!(
+        fingerprint,
+        ClientHelloFingerprint::Chrome
+            | ClientHelloFingerprint::Firefox
+            | ClientHelloFingerprint::Safari
+    ) {
+        if !exts
+            .iter()
+            .any(|e| e.ext_type() == ExtensionType::RenegotiationInfo)
+        {
+            insert_before_ech_or_psk(
+                &mut exts,
+                make_unknown_extension(
+                    ExtensionType::RenegotiationInfo,
+                    Payload::new(vec![0u8]),
+                ),
+            );
         }
-    });
+
+        if matches!(fingerprint, ClientHelloFingerprint::Chrome | ClientHelloFingerprint::Firefox)
+            && !exts.iter().any(|e| e.ext_type() == ExtensionType::SessionTicket)
+        {
+            insert_before_ech_or_psk(
+                &mut exts,
+                ClientExtension::SessionTicket(ClientSessionTicket::Request),
+            );
+        }
+
+        if matches!(fingerprint, ClientHelloFingerprint::Chrome | ClientHelloFingerprint::Safari)
+            && !exts.iter().any(|e| e.ext_type() == ExtensionType::SCT)
+        {
+            insert_before_ech_or_psk(
+                &mut exts,
+                make_unknown_extension(ExtensionType::SCT, Payload::empty()),
+            );
+        }
+
+        if matches!(fingerprint, ClientHelloFingerprint::Chrome | ClientHelloFingerprint::Safari) {
+            let grease1 = grease_value_from_seed(input.hello.extension_order_seed, 0x200);
+            let mut grease2 = grease_value_from_seed(input.hello.extension_order_seed, 0x201);
+            if grease2 == grease1 {
+                grease2 = grease_value_from_seed(input.hello.extension_order_seed, 0x202);
+            }
+
+            let has_ext = |typ: ExtensionType, exts: &[ClientExtension]| {
+                exts.iter().any(|e| e.ext_type() == typ)
+            };
+
+            if !has_ext(ExtensionType::Unknown(grease1), &exts) {
+                insert_before_ech_or_psk(
+                    &mut exts,
+                    make_unknown_extension(ExtensionType::Unknown(grease1), Payload::empty()),
+                );
+            }
+            if !has_ext(ExtensionType::Unknown(grease2), &exts) {
+                // BoringSSL uses a second GREASE extension with a 1-byte body.
+                insert_before_ech_or_psk(
+                    &mut exts,
+                    make_unknown_extension(
+                        ExtensionType::Unknown(grease2),
+                        Payload::new(vec![0u8]),
+                    ),
+                );
+            }
+        }
+
+        if !exts.iter().any(|e| e.ext_type() == ExtensionType::Padding) {
+            insert_before_ech_or_psk(
+                &mut exts,
+                make_unknown_extension(ExtensionType::Padding, Payload::empty()),
+            );
+        }
+    }
+
+    // Order extensions.
+    //
+    // Extensions MAY be randomized, but (for compatibility) we also keep the same
+    // order as the previous ClientHello when retrying after an HRR.
+    match fingerprint {
+        ClientHelloFingerprint::Firefox | ClientHelloFingerprint::Safari => {
+            exts.sort_by_cached_key(|new_ext| {
+                match (&cx.data.ech_status, new_ext) {
+                    // When not offering ECH/GREASE, the PSK extension is always last.
+                    (EchStatus::NotOffered, ClientExtension::PresharedKey(..)) => return u32::MAX,
+                    // When ECH or GREASE are in-play, the ECH extension is always last.
+                    (_, ClientExtension::EncryptedClientHello(_)) => return u32::MAX,
+                    // ... and the PSK extension should be second-to-last.
+                    (_, ClientExtension::PresharedKey(..)) => return u32::MAX - 1,
+                    _ => {}
+                };
+
+                let ext_type = new_ext.ext_type();
+                let rank: u32 = match fingerprint {
+                    ClientHelloFingerprint::Firefox => match ext_type {
+                        ExtensionType::ServerName => 0,
+                        ExtensionType::ExtendedMasterSecret => 1,
+                        ExtensionType::RenegotiationInfo => 2,
+                        ExtensionType::EllipticCurves => 3,
+                        ExtensionType::ECPointFormats => 4,
+                        ExtensionType::SessionTicket => 5,
+                        ExtensionType::ALProtocolNegotiation => 6,
+                        ExtensionType::StatusRequest => 7,
+                        ExtensionType::KeyShare => 8,
+                        ExtensionType::SupportedVersions => 9,
+                        ExtensionType::SignatureAlgorithms => 10,
+                        ExtensionType::PSKKeyExchangeModes => 11,
+                        ExtensionType::CompressCertificate => 12,
+                        ExtensionType::Padding => 13,
+                        _ => 1000,
+                    },
+                    ClientHelloFingerprint::Safari => match new_ext {
+                        ClientExtension::Unknown(UnknownExtension {
+                            typ: ExtensionType::Unknown(v),
+                            payload,
+                        }) if is_grease_value(*v) && payload.bytes().is_empty() => 0,
+                        ClientExtension::Unknown(UnknownExtension {
+                            typ: ExtensionType::Unknown(v),
+                            payload,
+                        }) if is_grease_value(*v) && !payload.bytes().is_empty() => 14,
+                        _ => match ext_type {
+                            ExtensionType::ServerName => 1,
+                            ExtensionType::ExtendedMasterSecret => 2,
+                            ExtensionType::RenegotiationInfo => 3,
+                            ExtensionType::EllipticCurves => 4,
+                            ExtensionType::ECPointFormats => 5,
+                            ExtensionType::ALProtocolNegotiation => 6,
+                            ExtensionType::StatusRequest => 7,
+                            ExtensionType::SignatureAlgorithms => 8,
+                            ExtensionType::SCT => 9,
+                            ExtensionType::KeyShare => 10,
+                            ExtensionType::PSKKeyExchangeModes => 11,
+                            ExtensionType::SupportedVersions => 12,
+                            ExtensionType::CompressCertificate => 13,
+                            ExtensionType::Padding => 15,
+                            _ => 1000,
+                        },
+                    },
+                    _ => 1000,
+                };
+
+                rank.saturating_mul(0x10000) + (u16::from(ext_type) as u32)
+            });
+        }
+        _ => {
+            exts.sort_by_cached_key(|new_ext| {
+                match (&cx.data.ech_status, new_ext) {
+                    // When not offering ECH/GREASE, the PSK extension is always last.
+                    (EchStatus::NotOffered, ClientExtension::PresharedKey(..)) => return u32::MAX,
+                    // When ECH or GREASE are in-play, the ECH extension is always last.
+                    (_, ClientExtension::EncryptedClientHello(_)) => return u32::MAX,
+                    // ... and the PSK extension should be second-to-last.
+                    (_, ClientExtension::PresharedKey(..)) => return u32::MAX - 1,
+                    _ => {}
+                };
+
+                let seed = ((input.hello.extension_order_seed as u32) << 16)
+                    | (u16::from(new_ext.ext_type()) as u32);
+                match low_quality_integer_hash(seed) {
+                    u32::MAX => 0,
+                    key => key,
+                }
+            });
+        }
+    }
 
     let mut cipher_suites: Vec<_> = config
         .provider
@@ -541,6 +811,15 @@ fn emit_client_hello_for_retry(
             }
         }
         _ => {}
+    }
+
+    if matches!(
+        config.client_hello_fingerprint,
+        ClientHelloFingerprint::Chrome
+            | ClientHelloFingerprint::Firefox
+            | ClientHelloFingerprint::Safari
+    ) {
+        apply_boring_padding(&mut chp_payload);
     }
 
     // Note what extensions we sent.

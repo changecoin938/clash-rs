@@ -2,9 +2,13 @@ use futures::TryFutureExt;
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static NEXT_RUNTIME_ID: AtomicU32 = AtomicU32::new(1);
 
 pub fn start_clash(options: clash_lib::Options) -> Result<(), clash_lib::Error> {
-    clash_lib::start_scaffold(1,options)
+    let id = NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed);
+    clash_lib::start_scaffold(id, options)
 }
 
 pub fn wait_port_ready(port: u16) -> Result<(), clash_lib::Error> {

@@ -4,7 +4,7 @@ use futures::ready;
 use h2::{RecvStream, SendStream};
 use http::Request;
 use rand::Rng;
-use std::{collections::HashMap, fmt::Debug};
+use std::{collections::HashMap, fmt::Debug, io};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::error;
 
@@ -55,7 +55,7 @@ impl Client {
             }
         }
 
-        Ok(request.body(()).expect("build req"))
+        request.body(()).map_err(map_io_error)
     }
 }
 
@@ -83,6 +83,7 @@ pub struct Http2Stream {
     recv: RecvStream,
     send: SendStream<Bytes>,
     buffer: BytesMut,
+    shutdown_sent: bool,
 }
 
 impl Debug for Http2Stream {
@@ -101,6 +102,7 @@ impl Http2Stream {
             recv,
             send,
             buffer: BytesMut::with_capacity(1024 * 4),
+            shutdown_sent: false,
         }
     }
 }
@@ -137,7 +139,8 @@ impl AsyncRead for Http2Stream {
                         |_| Ok(()),
                     )
             }
-            _ => Ok(()),
+            Some(Err(e)) => Err(io::Error::new(io::ErrorKind::ConnectionReset, e)),
+            None => Ok(()),
         })
     }
 }
@@ -150,13 +153,16 @@ impl AsyncWrite for Http2Stream {
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
         self.send.reserve_capacity(buf.len());
         std::task::Poll::Ready(match ready!(self.send.poll_capacity(cx)) {
-            Some(Ok(to_write)) => self
+            Some(Ok(to_write)) => {
+                let to_write = std::cmp::min(to_write, buf.len());
+                self
                 .send
                 .send_data(Bytes::from(buf[..to_write].to_owned()), false)
                 .map_or_else(
                     |e| Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e)),
                     |_| Ok(to_write),
-                ),
+                )
+            }
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "broken pipe",
@@ -173,20 +179,16 @@ impl AsyncWrite for Http2Stream {
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        self.send.reserve_capacity(0);
-        std::task::Poll::Ready(ready!(self.send.poll_capacity(cx)).map_or(
-            Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "broken pipe",
-            )),
-            |_| {
-                self.send.send_data(Bytes::new(), true).map_or_else(
-                    |e| Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e)),
-                    |_| Ok(()),
-                )
-            },
-        ))
+        if self.shutdown_sent {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        self.shutdown_sent = true;
+        std::task::Poll::Ready(
+            self.send
+                .send_data(Bytes::new(), true)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e)),
+        )
     }
 }

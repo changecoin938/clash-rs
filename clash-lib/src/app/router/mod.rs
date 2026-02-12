@@ -358,15 +358,9 @@ pub fn map_rule_type(
 mod tests {
     use std::sync::Arc;
 
-    use anyhow::Ok;
-
     use crate::{
-        app::dns::{MockClashResolver, SystemResolver},
-        common::{
-            geodata::{DEFAULT_GEOSITE_DOWNLOAD_URL, GeoData},
-            http::new_http_client,
-            mmdb::{DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL, Mmdb},
-        },
+        app::dns::MockClashResolver,
+        common::mmdb::{MmdbLookupAsn, MmdbLookupCountry, MockMmdbLookupTrait},
         config::internal::rule::RuleType,
         session::Session,
         tests::initialize,
@@ -390,29 +384,25 @@ mod tests {
         });
         let mock_resolver = Arc::new(mock_resolver);
 
-        let real_resolver = Arc::new(SystemResolver::new(false).unwrap());
-
-        let client = new_http_client(real_resolver.clone(), None).unwrap();
-
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        let mmdb = Mmdb::new(
-            temp_dir.path().join("mmdb.mmdb"),
-            DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL.to_string(),
-            client,
-        )
-        .await
-        .unwrap();
-
-        let client = new_http_client(real_resolver.clone(), None).unwrap();
-
-        let geodata = GeoData::new(
-            temp_dir.path().join("geodata.geodata"),
-            DEFAULT_GEOSITE_DOWNLOAD_URL.to_string(),
-            client,
-        )
-        .await
-        .unwrap();
+        let mut mmdb = MockMmdbLookupTrait::new();
+        mmdb.expect_lookup_country().returning(|ip| {
+            if ip == std::net::IpAddr::V4(std::net::Ipv4Addr::new(114, 114, 114, 114)) {
+                Ok(MmdbLookupCountry {
+                    country_code: "CN".to_owned(),
+                })
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "country not found",
+                ))
+            }
+        });
+        mmdb.expect_lookup_asn().returning(|_| {
+            Ok(MmdbLookupAsn {
+                asn_name: String::new(),
+            })
+        });
+        let mmdb = Arc::new(mmdb);
 
         let router = super::Router::new(
             vec![
@@ -441,10 +431,10 @@ mod tests {
             ],
             Default::default(),
             mock_resolver,
-            Some(Arc::new(mmdb)),
+            Some(mmdb),
             None,
-            Some(Arc::new(geodata)),
-            temp_dir.path().to_str().unwrap().to_string(),
+            None,
+            String::new(),
         )
         .await;
 

@@ -20,12 +20,16 @@ impl TryFrom<&OutboundSocks5> for Handler {
 
     fn try_from(s: &OutboundSocks5) -> Result<Self, Self::Error> {
         let tls_client = if s.tls {
-            Some(Box::new(TlsClient::new(
+            let mut client = TlsClient::new(
                 s.skip_cert_verify,
                 s.sni.clone().unwrap_or(s.common_opts.server.to_owned()),
                 None,
                 None,
-            )) as _)
+            );
+            if s.client_fingerprint.is_some() {
+                client.set_client_fingerprint(s.client_fingerprint.clone());
+            }
+            Some(Box::new(client) as _)
         } else {
             None
         };

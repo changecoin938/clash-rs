@@ -5,7 +5,7 @@ use pki_types::{CertificateDer, PrivateKeyDer};
 
 use super::client_conn::Resumption;
 use crate::builder::{ConfigBuilder, WantsVerifier};
-use crate::client::{ClientConfig, EchMode, ResolvesClientCert, handy};
+use crate::client::{ClientConfig, ClientHelloFingerprint, EchMode, ResolvesClientCert, handy};
 use crate::error::Error;
 use crate::key_log::NoKeyLog;
 use crate::sign::{CertifiedKey, SingleCertAndKey};
@@ -164,6 +164,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
     ) -> ClientConfig {
         ClientConfig {
             reality: None,
+            client_hello_fingerprint: ClientHelloFingerprint::Randomized,
             provider: self.provider,
             alpn_protocols: Vec::new(),
             resumption: Resumption::default(),

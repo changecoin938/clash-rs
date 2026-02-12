@@ -508,8 +508,7 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<net::Ipv4Addr>> {
-        if enhanced
-            && let Some(hosts) = &self.hosts
+        if let Some(hosts) = &self.hosts
             && let Some(v) = hosts.search(host)
         {
             return Ok(v.get_data().map(|v| match v {
@@ -547,14 +546,13 @@ impl ClashResolver for EnhancedResolver {
     async fn resolve_v6(
         &self,
         host: &str,
-        enhanced: bool,
+        _enhanced: bool,
     ) -> anyhow::Result<Option<net::Ipv6Addr>> {
         if !self.ipv6.load(Relaxed) {
             return Err(Error::DNSError("ipv6 disabled".into()).into());
         }
 
-        if enhanced
-            && let Some(hosts) = &self.hosts
+        if let Some(hosts) = &self.hosts
             && let Some(v) = hosts.search(host)
         {
             return Ok(v.get_data().map(|v| match v {

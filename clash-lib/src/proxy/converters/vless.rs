@@ -60,6 +60,7 @@ impl TryFrom<&OutboundVless> for Handler {
             transport: s
                 .network
                 .clone()
+                .filter(|x| x != "tcp" && !x.is_empty())
                 .map(|x| match x.as_str() {
                     "tcp_http" => s
                         .tcp_http_opts
@@ -131,15 +132,22 @@ impl TryFrom<&OutboundVless> for Handler {
                                 "xhttp-opts is required for xhttp".to_owned(),
                             ))
                             .and_then(|x| {
-                                if let Some(mode) =
-                                    x.mode.as_deref().filter(|x| !x.is_empty())
-                                    && mode != "auto"
-                                    && mode != "stream"
-                                    && mode != "stream-one"
-                                {
-                                    return Err(Error::InvalidConfig(format!(
-                                        "unsupported xhttp mode: {mode}"
-                                    )));
+                                if let Some(mode) = x.mode.as_deref().filter(|x| !x.is_empty()) {
+                                    let mode = mode.to_ascii_lowercase();
+                                    if mode != "auto"
+                                        && mode != "packet"
+                                        && mode != "packet-up"
+                                        && mode != "packet_up"
+                                        && mode != "stream"
+                                        && mode != "stream-up"
+                                        && mode != "stream_up"
+                                        && mode != "stream-one"
+                                        && mode != "stream_one"
+                                    {
+                                        return Err(Error::InvalidConfig(format!(
+                                            "unsupported xhttp mode: {mode}"
+                                        )));
+                                    }
                                 }
 
                                 let client: XHttpClient =
@@ -151,7 +159,7 @@ impl TryFrom<&OutboundVless> for Handler {
                                             ))
                                         })?;
                                 Ok(Box::new(client) as _)
-                            })
+                        })
                     }
                     _ => Err(Error::InvalidConfig(format!(
                         "unsupported network: {x}"
@@ -190,6 +198,7 @@ impl TryFrom<&OutboundVless> for Handler {
                         s.network
                             .as_ref()
                             .map(|x| match x.as_str() {
+                                "tcp" => Ok(vec![]),
                                 "tcp_http" => Ok(vec!["http/1.1".to_owned()]),
                                 "ws" => Ok(vec!["http/1.1".to_owned()]),
                                 "http" => Ok(vec![]),
@@ -200,8 +209,16 @@ impl TryFrom<&OutboundVless> for Handler {
                                 ))),
                             })
                             .transpose()?,
-                        None,
+                        match s.network.as_deref() {
+                            Some("xhttp") | Some("h2") | Some("grpc") => {
+                                Some("h2".to_owned())
+                            }
+                            _ => None,
+                        },
                     );
+                    if s.client_fingerprint.is_some() {
+                        client.set_client_fingerprint(s.client_fingerprint.clone());
+                    }
                     if let Some(reality_opts) = s.reality_opts.as_ref() {
                         let public_key = reality_opts
                             .public_key
@@ -240,13 +257,6 @@ impl TryFrom<&OutboundVless> for Handler {
                                 })?
                             }
                         };
-
-                        if let Some(fp) = s.client_fingerprint.as_ref() {
-                            warn!(
-                                "client-fingerprint is currently ignored for REALITY: {}",
-                                fp
-                            );
-                        }
 
                         // REALITY servers can optionally enforce a client version range.
                         // Xray-core currently uses 26.2.6 in its REALITY clienthello SessionID.

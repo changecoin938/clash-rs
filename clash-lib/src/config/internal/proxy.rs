@@ -187,6 +187,8 @@ pub struct OutboundShadowsocks {
     pub skip_cert_verify: Option<bool>,
     #[serde(alias = "servername")]
     pub server_name: Option<String>,
+    #[serde(alias = "client-fingerprint")]
+    pub client_fingerprint: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -201,6 +203,8 @@ pub struct OutboundSocks5 {
     pub sni: Option<String>,
     #[serde(default = "Default::default")]
     pub skip_cert_verify: bool,
+    #[serde(alias = "client-fingerprint")]
+    pub client_fingerprint: Option<String>,
     #[serde(default = "default_bool_true")]
     pub udp: bool,
 }

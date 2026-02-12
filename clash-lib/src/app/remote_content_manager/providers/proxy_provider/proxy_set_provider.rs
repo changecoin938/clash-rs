@@ -286,17 +286,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_set_provider() {
+        let mock_server = httpmock::MockServer::start();
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/health");
+            then.status(204);
+        });
+        let healthcheck_url = mock_server.url("/health");
+
         let mut mock_vehicle = MockProviderVehicle::new();
 
         mock_vehicle.expect_read().returning(|| {
             Ok(r#"
 proxies:
-  - name: "ss"
-    type: ss
-    server: localhost
-    port: 8388
-    cipher: aes-256-gcm
-    password: "password"
+  - name: "socks"
+    type: socks5
+    server: 127.0.0.1
+    port: 1
     udp: true
 "#
             .as_bytes()
@@ -316,7 +321,7 @@ proxies:
         let latency_manager = ProxyManager::new(Arc::new(mock_resolver));
         let hc = HealthCheck::new(
             vec![],
-            "http://www.google.com".to_owned(),
+            healthcheck_url,
             0,
             true,
             latency_manager.clone(),

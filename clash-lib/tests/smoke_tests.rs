@@ -1,3 +1,5 @@
+#![cfg(feature = "shadowsocks")]
+
 use clash_lib::{Config, Options};
 use common::{start_clash, wait_port_ready};
 use std::path::PathBuf;

@@ -31,6 +31,25 @@ use crate::unbuffered::{EncryptError, TransmitTlsData};
 use crate::{DistinguishedName, crypto};
 use crate::{KeyLog, WantsVersions, compress, sign, verify, versions};
 
+/// Controls how rustls constructs the ClientHello to imitate common TLS stacks.
+///
+/// Note: this is a best-effort feature. rustls cannot perfectly replicate every
+/// uTLS profile because it only advertises cipher suites, key exchange groups,
+/// and extensions it can actually implement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientHelloFingerprint {
+    /// Randomize extension order (existing rustls-reality behavior).
+    Randomized,
+    /// Chrome-like ClientHello (adds GREASE/padding, etc).
+    Chrome,
+    /// Firefox-like ClientHello.
+    Firefox,
+    /// Safari/iOS-like ClientHello.
+    Safari,
+    /// Randomize but do not offer ALPN.
+    RandomizedNoAlpn,
+}
+
 /// A trait for the ability to store client session data, so that sessions
 /// can be resumed in future connections.
 ///
@@ -162,7 +181,10 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
 /// [`RootCertStore`]: crate::RootCertStore
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
+    /// REALITY settings for Xray-compatible TLS handshake authentication.
     pub reality: Option<RealityConfig>,
+    /// ClientHello fingerprint profile.
+    pub client_hello_fingerprint: ClientHelloFingerprint,
 
     /// Which ALPN protocols we include in our client hello.
     /// If empty, no ALPN extension is sent.
@@ -286,6 +308,7 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
+    /// Enable REALITY (Xray) client authentication for this config.
     pub fn add_reality(
         &mut self,
         reality_public_key: Vec<u8>,
@@ -302,6 +325,11 @@ impl ClientConfig {
             reality_version_z,
         };
         self.reality = Some(reality);
+    }
+
+    /// Choose the ClientHello fingerprint profile to use for outgoing connections.
+    pub fn set_client_hello_fingerprint(&mut self, fp: ClientHelloFingerprint) {
+        self.client_hello_fingerprint = fp;
     }
 
     /// Create a builder for a client configuration with

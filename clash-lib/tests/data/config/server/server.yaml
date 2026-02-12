@@ -14,5 +14,9 @@ mode: rule
 log-level: trace
 external-controller: :9091
 
+profile:
+  store-selected: false
+  store-fake-ip: false
+
 rules:
   - MATCH, DIRECT

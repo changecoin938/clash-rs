@@ -115,7 +115,7 @@ impl TryFrom<(Option<String>, &XHttpOpt, &CommonConfigOptions)> for XHttpClient 
         Ok(XHttpClient::new(
             host,
             headers,
-            http::Method::POST,
+            x.mode.clone(),
             path.try_into()?,
         ))
     }

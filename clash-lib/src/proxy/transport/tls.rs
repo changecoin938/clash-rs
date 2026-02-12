@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::Serialize;
 use std::{io, sync::Arc};
+use tracing::warn;
 
 use super::Transport;
 use crate::{
@@ -36,6 +37,7 @@ pub struct Client {
     pub sni: String,
     pub alpn: Option<Vec<String>>,
     pub expected_alpn: Option<String>,
+    client_fingerprint: Option<String>,
     reality: Option<RealityOptions>,
 }
 
@@ -51,6 +53,7 @@ impl Client {
             sni,
             alpn,
             expected_alpn,
+            client_fingerprint: None,
             reality: None,
         }
     }
@@ -66,6 +69,10 @@ impl Client {
             short_id,
             version,
         });
+    }
+
+    pub fn set_client_fingerprint(&mut self, fingerprint: Option<String>) {
+        self.client_fingerprint = fingerprint;
     }
 }
 
@@ -98,6 +105,29 @@ impl Transport for Client {
                 reality.version[1],
                 reality.version[2],
             );
+        }
+
+        if let Some(fp) = self.client_fingerprint.as_deref() {
+            let profile = match fp.to_ascii_lowercase().as_str() {
+                "chrome" | "edge" | "360" | "qq" | "android" => {
+                    Some(rustls::client::ClientHelloFingerprint::Chrome)
+                }
+                "firefox" => Some(rustls::client::ClientHelloFingerprint::Firefox),
+                "safari" | "ios" => Some(rustls::client::ClientHelloFingerprint::Safari),
+                "random" | "randomized" | "unsafe" => {
+                    Some(rustls::client::ClientHelloFingerprint::Randomized)
+                }
+                "randomizednoalpn" => {
+                    Some(rustls::client::ClientHelloFingerprint::RandomizedNoAlpn)
+                }
+                other => {
+                    warn!("unknown client-fingerprint: {other}");
+                    None
+                }
+            };
+            if let Some(profile) = profile {
+                tls_config.set_client_hello_fingerprint(profile);
+            }
         }
 
         if std::env::var("SSLKEYLOGFILE").is_ok() {

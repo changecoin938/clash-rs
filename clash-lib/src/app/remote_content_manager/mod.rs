@@ -997,9 +997,16 @@ mod tests {
     #[tokio::test]
     async fn test_proxy_manager_alive() {
         initialize();
+        let mock_server = httpmock::MockServer::start();
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/generate_204");
+            then.status(204);
+        });
+        let url = mock_server.url("/generate_204");
+
         let mut mock_resolver = MockClashResolver::new();
         mock_resolver.expect_resolve().returning(|_, _| {
-            Ok(Some(std::net::IpAddr::V4(Ipv4Addr::new(172, 217, 167, 67))))
+            Ok(Some(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))))
         });
         mock_resolver.expect_ipv6().return_const(false);
 
@@ -1011,19 +1018,14 @@ mod tests {
         manager
             .url_test(
                 mock_handler.clone(),
-                "http://www.gstatic.com/generate_204",
+                &url,
                 None,
             )
             .await
             .expect("test failed");
 
         assert!(manager.alive(PROXY_DIRECT).await);
-        assert!(
-            manager
-                .last_delay(PROXY_DIRECT)
-                .await
-                .is_some_and(|x| x.as_millis() > 0)
-        );
+        assert!(manager.last_delay(PROXY_DIRECT).await.is_some());
         assert!(!manager.delay_history(PROXY_DIRECT).await.is_empty());
 
         manager.report_alive(PROXY_DIRECT, false).await;
@@ -1033,7 +1035,7 @@ mod tests {
             manager
                 .url_test(
                     mock_handler.clone(),
-                    "http://www.gstatic.com/generate_204",
+                    &url,
                     None,
                 )
                 .await
@@ -1041,12 +1043,7 @@ mod tests {
         }
 
         assert!(manager.alive(PROXY_DIRECT).await);
-        assert!(
-            manager
-                .last_delay(PROXY_DIRECT)
-                .await
-                .is_some_and(|x| x.as_millis() > 0)
-        );
+        assert!(manager.last_delay(PROXY_DIRECT).await.is_some());
         assert_eq!(manager.delay_history(PROXY_DIRECT).await.len(), 10);
     }
 
