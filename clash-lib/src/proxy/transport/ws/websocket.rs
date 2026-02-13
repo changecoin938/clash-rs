@@ -14,6 +14,7 @@ pub struct WebsocketConn {
     inner: WebSocketStream<AnyStream>,
     read_buffer: BytesMut,
     need_flush: bool,
+    pending_write_len: usize,
 }
 
 impl Debug for WebsocketConn {
@@ -30,6 +31,7 @@ impl WebsocketConn {
             inner: stream,
             read_buffer: BytesMut::new(),
             need_flush: false,
+            pending_write_len: 0,
         }
     }
 }
@@ -81,17 +83,23 @@ impl AsyncWrite for WebsocketConn {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        if buf.is_empty() && !self.need_flush {
+            return std::task::Poll::Ready(Ok(0));
+        }
         if !self.need_flush {
-        ready!(Pin::new(&mut self.inner).poll_ready(cx)).map_err(map_io_error)?;
-        let message = Message::Binary(Bytes::copy_from_slice(buf));
+            ready!(Pin::new(&mut self.inner).poll_ready(cx)).map_err(map_io_error)?;
+            let message = Message::Binary(Bytes::copy_from_slice(buf));
 
             Pin::new(&mut self.inner)
                 .start_send(message)
                 .map_err(map_io_error)?;
             self.need_flush = true;
+            self.pending_write_len = buf.len();
         }
-        ready!(self.poll_flush(cx))?;
-        std::task::Poll::Ready(Ok(buf.len()))
+        let written = self.pending_write_len;
+        ready!(self.as_mut().poll_flush(cx))?;
+        self.pending_write_len = 0;
+        std::task::Poll::Ready(Ok(written))
     }
 
     fn poll_flush(

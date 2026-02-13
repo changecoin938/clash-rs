@@ -425,7 +425,7 @@ impl Handler {
 
         // Sort by score (lower is better)
         candidates.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            a.0.total_cmp(&b.0).then_with(|| a.2.cmp(&b.2))
         });
 
         if candidates.is_empty() {

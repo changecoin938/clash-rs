@@ -182,13 +182,22 @@ impl OutboundHandler for Handler {
 
         let config = Arc::new(config);
 
-        let server_public_key = self.opts.host_key.as_ref().map(|x| {
-            x.iter()
-                .filter_map(|x| {
-                    russh::keys::ssh_key::PublicKey::from_openssh(x).ok()
-                })
-                .collect::<Vec<_>>()
-        });
+        let server_public_key = match self.opts.host_key.as_ref() {
+            None => None,
+            Some(keys) => {
+                let mut parsed = Vec::with_capacity(keys.len());
+                for (idx, key) in keys.iter().enumerate() {
+                    let pk = russh::keys::ssh_key::PublicKey::from_openssh(key)
+                        .map_err(|e| {
+                            io::Error::other(format!(
+                                "invalid ssh host key #{idx}: {e}"
+                            ))
+                        })?;
+                    parsed.push(pk);
+                }
+                Some(parsed)
+            }
+        };
         let sh = connector::Client { server_public_key };
 
         // TODO: adding fw_mark

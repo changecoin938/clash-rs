@@ -182,12 +182,15 @@ impl Handler {
         let mut quinn_config =
             QuinnConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
         let mut transport_config = QuinnTransportConfig::default();
+        let idle_timeout = opts.idle_timeout.try_into().map_err(|e| {
+            anyhow::anyhow!("invalid tuic idle_timeout {:?}: {e}", opts.idle_timeout)
+        })?;
         transport_config
             .max_concurrent_bidi_streams(opts.max_open_stream)
             .max_concurrent_uni_streams(opts.max_open_stream)
             .send_window(opts.send_window)
             .stream_receive_window(opts.receive_window)
-            .max_idle_timeout(Some(opts.idle_timeout.try_into().unwrap()));
+            .max_idle_timeout(Some(idle_timeout));
         match opts.congestion_controller {
             CongestionControl::Cubic => transport_config
                 .congestion_controller_factory(Arc::new(CubicConfig::default())),
