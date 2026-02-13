@@ -11,6 +11,7 @@ use crate::{ proxy::AnyStream};
 pub struct Client {
     pub host: String,
     pub path: http::uri::PathAndQuery,
+    pub headers: HashMap<String, String>,
 }
 
 impl Client {
@@ -21,7 +22,12 @@ impl Client {
         Self {
             host,
             path,
+            headers: HashMap::new(),
         }
+    }
+
+    pub fn set_headers(&mut self, headers: HashMap<String, String>) {
+        self.headers = headers;
     }
     fn make_request(
         &self,
@@ -30,7 +36,7 @@ impl Client {
         version: String,
         host:String,
     ) -> String {
-        let mut headers: HashMap<String, String> = HashMap::new();
+        let mut headers: HashMap<String, String> = self.headers.clone();
         let default_user_agent =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0";
         let default_accept =
@@ -269,4 +275,26 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_http_request_includes_custom_headers() {
+        let mut client = Client::new(
+            "example.com".to_owned(),
+            http::uri::PathAndQuery::from_static("/"),
+        );
+        let mut headers = HashMap::new();
+        headers.insert("User-Agent".to_owned(), "my-ua".to_owned());
+        headers.insert("X-Test".to_owned(), "1".to_owned());
+        client.set_headers(headers);
+
+        let req = client.get_request();
+        assert!(req.contains("Host: example.com\r\n"));
+        assert!(req.contains("User-Agent: my-ua\r\n"));
+        assert!(req.contains("X-Test: 1\r\n"));
+    }
 }

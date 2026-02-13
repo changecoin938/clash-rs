@@ -96,6 +96,11 @@ xcodebuild -create-xcframework \
 
 echo "XCFramework created at $XCFRAMEWORK_DIR"
 
+# Some filesystems (e.g. exFAT) can't store extended attributes, so macOS may
+# create AppleDouble `._*` files. These confuse Xcode module scanning.
+find "$XCFRAMEWORK_DIR" -name "._*" -delete || true
+find "$XCFRAMEWORK_DIR" -name ".DS_Store" -delete || true
+
 # Cleanup all intermediate files, keep only the XCFramework
 echo "Cleaning up intermediate files..."
 find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 ! -name "$(basename $XCFRAMEWORK_DIR)" -exec rm -rf {} +

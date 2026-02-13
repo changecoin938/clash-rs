@@ -1,7 +1,7 @@
 use super::{
     AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
     OutboundHandler, OutboundType,
-    transport::Transport,
+    transport::{GrpcPooledClient, Transport},
     utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
 };
 use crate::{
@@ -32,6 +32,7 @@ pub struct HandlerOptions {
     pub security: String,
     pub udp: bool,
     pub transport: Option<Box<dyn Transport>>,
+    pub grpc: Option<GrpcPooledClient>,
     // maybe shadow-tls?
     pub tls: Option<Box<dyn Transport>>,
 }
@@ -60,6 +61,23 @@ impl Handler {
         }
     }
 
+    async fn wrap_stream_after_transport<'a>(
+        &'a self,
+        s: AnyStream,
+        sess: &'a Session,
+        udp: bool,
+    ) -> io::Result<AnyStream> {
+        let vmess_builder = vmess_impl::Builder::new(&vmess_impl::VmessOption {
+            uuid: self.opts.uuid.to_owned(),
+            alter_id: self.opts.alter_id,
+            security: self.opts.security.to_owned(),
+            udp,
+            dst: sess.destination.clone(),
+        })?;
+
+        vmess_builder.proxy_stream(s).await
+    }
+
     async fn inner_proxy_stream<'a>(
         &'a self,
         s: AnyStream,
@@ -77,16 +95,7 @@ impl Handler {
         } else {
             s
         };
-
-        let vmess_builder = vmess_impl::Builder::new(&vmess_impl::VmessOption {
-            uuid: self.opts.uuid.to_owned(),
-            alter_id: self.opts.alter_id,
-            security: self.opts.security.to_owned(),
-            udp,
-            dst: sess.destination.clone(),
-        })?;
-
-        vmess_builder.proxy_stream(s).await
+        self.wrap_stream_after_transport(s, sess, udp).await
     }
 }
 
@@ -160,18 +169,50 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedStream> {
-        let stream = connector
-            .connect_stream(
-                resolver,
-                self.opts.server.as_str(),
-                self.opts.port,
-                sess.iface.as_ref(),
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
-            )
-            .await?;
+        let iface = sess.iface.clone();
+        #[cfg(target_os = "linux")]
+        let so_mark = sess.so_mark;
 
-        let s = self.inner_proxy_stream(stream, sess, false).await?;
+        let s = if let Some(grpc) = self.opts.grpc.as_ref() {
+            let tls = self.opts.tls.as_ref();
+            let grpc_stream = grpc
+                .open_stream(|| {
+                    let resolver = resolver.clone();
+                    let iface = iface.clone();
+                    async move {
+                        let stream = connector
+                            .connect_stream(
+                                resolver,
+                                self.opts.server.as_str(),
+                                self.opts.port,
+                                iface.as_ref(),
+                                #[cfg(target_os = "linux")]
+                                so_mark,
+                            )
+                            .await?;
+                        if let Some(tls) = tls {
+                            tls.proxy_stream(stream).await
+                        } else {
+                            Ok(stream)
+                        }
+                    }
+                })
+                .await?;
+            self.wrap_stream_after_transport(grpc_stream, sess, false)
+                .await?
+        } else {
+            let stream = connector
+                .connect_stream(
+                    resolver,
+                    self.opts.server.as_str(),
+                    self.opts.port,
+                    iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    so_mark,
+                )
+                .await?;
+            self.inner_proxy_stream(stream, sess, false).await?
+        };
         let chained = ChainedStreamWrapper::new(s);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
@@ -183,18 +224,50 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedDatagram> {
-        let stream = connector
-            .connect_stream(
-                resolver,
-                self.opts.server.as_str(),
-                self.opts.port,
-                sess.iface.as_ref(),
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
-            )
-            .await?;
+        let iface = sess.iface.clone();
+        #[cfg(target_os = "linux")]
+        let so_mark = sess.so_mark;
 
-        let stream = self.inner_proxy_stream(stream, sess, true).await?;
+        let stream = if let Some(grpc) = self.opts.grpc.as_ref() {
+            let tls = self.opts.tls.as_ref();
+            let grpc_stream = grpc
+                .open_stream(|| {
+                    let resolver = resolver.clone();
+                    let iface = iface.clone();
+                    async move {
+                        let stream = connector
+                            .connect_stream(
+                                resolver,
+                                self.opts.server.as_str(),
+                                self.opts.port,
+                                iface.as_ref(),
+                                #[cfg(target_os = "linux")]
+                                so_mark,
+                            )
+                            .await?;
+                        if let Some(tls) = tls {
+                            tls.proxy_stream(stream).await
+                        } else {
+                            Ok(stream)
+                        }
+                    }
+                })
+                .await?;
+            self.wrap_stream_after_transport(grpc_stream, sess, true)
+                .await?
+        } else {
+            let stream = connector
+                .connect_stream(
+                    resolver,
+                    self.opts.server.as_str(),
+                    self.opts.port,
+                    iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    so_mark,
+                )
+                .await?;
+            self.inner_proxy_stream(stream, sess, true).await?
+        };
 
         let d = OutboundDatagramVmess::new(stream, sess.destination.clone());
 
@@ -278,6 +351,7 @@ mod tests {
             udp: true,
             tls: tls_client(None),
             transport: Some(Box::new(ws_client)),
+            grpc: None,
         };
         let handler = Arc::new(Handler::new(opts));
         let runner = get_ws_runner().await?;
@@ -305,10 +379,8 @@ mod tests {
     #[serial_test::serial]
     async fn test_vmess_grpc() -> anyhow::Result<()> {
         initialize();
-        let grpc_client = GrpcClient::new(
-            "example.org".to_owned(),
-            "example!".to_owned().try_into()?,
-        );
+        let grpc_client =
+            GrpcClient::new("example.org".to_owned(), "example!".to_owned());
         let opts = HandlerOptions {
             name: "test-vmess-grpc".into(),
             common_opts: Default::default(),
@@ -320,6 +392,7 @@ mod tests {
             udp: true,
             tls: tls_client(None),
             transport: Some(Box::new(grpc_client)),
+            grpc: None,
         };
         let handler = Arc::new(Handler::new(opts));
         run_test_suites_and_cleanup(handler, get_grpc_runner().await?, Suite::all())
@@ -364,6 +437,7 @@ mod tests {
             udp: false,
             tls: tls_client(Some(vec!["h2".to_string()])),
             transport: Some(Box::new(h2_client)),
+            grpc: None,
         };
         let handler = Arc::new(Handler::new(opts));
         handler

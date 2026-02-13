@@ -184,9 +184,17 @@ pub struct OutboundShadowsocks {
     pub grpc_opts: Option<GrpcOpt>,
     pub tcp_http_opts: Option<TcpHttpOpt>,
     pub tls: Option<bool>,
+    #[serde(
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allowinsecure",
+        alias = "allow-insecure",
+        alias = "allow_insecure"
+    )]
     pub skip_cert_verify: Option<bool>,
     #[serde(alias = "servername")]
     pub server_name: Option<String>,
+    pub alpn: Option<Vec<String>>,
     #[serde(alias = "client-fingerprint")]
     pub client_fingerprint: Option<String>,
 }
@@ -202,6 +210,13 @@ pub struct OutboundSocks5 {
     pub tls: bool,
     pub sni: Option<String>,
     #[serde(default = "Default::default")]
+    #[serde(
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allowinsecure",
+        alias = "allow-insecure",
+        alias = "allow_insecure"
+    )]
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint")]
     pub client_fingerprint: Option<String>,
@@ -227,6 +242,7 @@ pub struct H2Opt {
 pub struct TcpHttpOpt {
     pub host: Option<String>,
     pub path: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
 }
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -247,6 +263,7 @@ pub struct XHttpOpt {
 #[serde(rename_all = "kebab-case")]
 pub struct GrpcOpt {
     pub grpc_service_name: Option<String>,
+    pub mode: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -257,6 +274,13 @@ pub struct OutboundTrojan {
     pub password: String,
     pub alpn: Option<Vec<String>>,
     pub sni: Option<String>,
+    #[serde(
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allowinsecure",
+        alias = "allow-insecure",
+        alias = "allow_insecure"
+    )]
     pub skip_cert_verify: Option<bool>,
     pub udp: Option<bool>,
     pub network: Option<String>,
@@ -278,7 +302,15 @@ pub struct OutboundVmess {
     pub alter_id: u16,
     pub cipher: Option<String>,
     pub udp: Option<bool>,
+    pub alpn: Option<Vec<String>>,
     pub tls: Option<bool>,
+    #[serde(
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allowinsecure",
+        alias = "allow-insecure",
+        alias = "allow_insecure"
+    )]
     pub skip_cert_verify: Option<bool>,
     #[serde(alias = "servername")]
     pub server_name: Option<String>,
@@ -301,7 +333,15 @@ pub struct OutboundVless {
     pub uuid: String,
     pub encryption: Option<String>,
     pub udp: Option<bool>,
+    pub alpn: Option<Vec<String>>,
     pub tls: Option<bool>,
+    #[serde(
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allowinsecure",
+        alias = "allow-insecure",
+        alias = "allow_insecure"
+    )]
     pub skip_cert_verify: Option<bool>,
     #[serde(alias = "servername")]
     pub server_name: Option<String>,
@@ -361,6 +401,13 @@ pub struct OutboundTuic {
     /// bytes
     pub max_udp_relay_packet_size: Option<u64>,
     pub fast_open: Option<bool>,
+    #[serde(
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allowinsecure",
+        alias = "allow-insecure",
+        alias = "allow_insecure"
+    )]
     pub skip_cert_verify: Option<bool>,
     pub max_open_stream: Option<u64>,
     pub sni: Option<String>,
@@ -457,6 +504,14 @@ pub struct OutboundHysteria2 {
     /// receive_bps: send by auth request
     pub down: Option<u64>,
     pub sni: Option<String>,
+    #[serde(
+        alias = "skip-cert-verify",
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allowinsecure",
+        alias = "allow-insecure",
+        alias = "allow_insecure"
+    )]
     pub skip_cert_verify: bool,
     pub ca: Option<String>,
     pub ca_str: Option<String>,

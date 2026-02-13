@@ -23,9 +23,9 @@ pub struct OutboundDatagramTrojan {
     state: ReadState,
     read_buf: BytesMut,
 
-    written: Option<usize>,
     flushed: bool,
-    pkt: Option<UdpPacket>,
+    write_buf: BytesMut,
+    write_pos: usize,
 }
 
 impl OutboundDatagramTrojan {
@@ -37,9 +37,9 @@ impl OutboundDatagramTrojan {
             read_buf: BytesMut::new(),
             state: ReadState::Atyp,
 
-            written: None,
             flushed: true,
-            pkt: None,
+            write_buf: BytesMut::new(),
+            write_pos: 0,
         }
     }
 }
@@ -66,7 +66,12 @@ impl Sink<UdpPacket> for OutboundDatagramTrojan {
         item: UdpPacket,
     ) -> Result<(), Self::Error> {
         let pin = self.get_mut();
-        pin.pkt = Some(item);
+        pin.write_buf.clear();
+        item.dst_addr.write_buf(&mut pin.write_buf);
+        pin.write_buf.put_u16(item.data.len() as u16);
+        pin.write_buf.put_slice(b"\r\n");
+        pin.write_buf.put_slice(&item.data);
+        pin.write_pos = 0;
         pin.flushed = false;
         Ok(())
     }
@@ -79,56 +84,30 @@ impl Sink<UdpPacket> for OutboundDatagramTrojan {
             return Poll::Ready(Ok(()));
         }
 
-        let Self {
-            ref mut inner,
-            ref mut pkt,
-            ref mut written,
-            ref mut flushed,
-            ..
-        } = *self;
-
-        let mut inner = Pin::new(inner);
-
-        let pkt_container = pkt;
-
-        if let Some(pkt) = pkt_container {
-            let data = &pkt.data;
-
-            let mut payload = BytesMut::new();
-            pkt.dst_addr.write_buf(&mut payload);
-            payload.put_u16(data.len() as u16);
-            payload.put_slice(b"\r\n");
-            payload.put_slice(data);
-
-            if written.is_none() {
-                *written = Some(0);
+        let this = self.get_mut();
+        while this.write_pos < this.write_buf.len() {
+            let n = ready!(Pin::new(&mut this.inner).poll_write(
+                cx,
+                &this.write_buf[this.write_pos..],
+            ))?;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write trojan datagram",
+                )));
             }
-
-            while !payload.is_empty() {
-                let n = ready!(inner.as_mut().poll_write(cx, payload.as_ref()))?;
-                *written.as_mut().unwrap() += n;
-                payload.advance(n);
-
-                trace!(
-                    "written {} bytes to trojan stream, remaining {}, data len {}",
-                    n,
-                    payload.len(),
-                    data.len()
-                );
-            }
-
-            if !*flushed {
-                ready!(inner.as_mut().poll_flush(cx))?;
-                *flushed = true;
-            }
-            *written = None;
-            *pkt_container = None;
-
-            Poll::Ready(Ok(()))
-        } else {
-            debug!("no udp packet to send");
-            Poll::Ready(Err(io::Error::other("no packet to send")))
+            this.write_pos += n;
+            trace!(
+                "written {} bytes to trojan stream, remaining {} bytes",
+                n,
+                this.write_buf.len().saturating_sub(this.write_pos)
+            );
         }
+        ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
+        this.flushed = true;
+        this.write_buf.clear();
+        this.write_pos = 0;
+        Poll::Ready(Ok(()))
     }
 
     fn poll_close(
@@ -383,5 +362,153 @@ impl Stream for OutboundDatagramTrojan {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::{
+        io,
+        net::Ipv4Addr,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[derive(Clone, Default)]
+    struct FlakyStream {
+        written: Arc<Mutex<Vec<u8>>>,
+        pending_next: bool,
+        max_write: usize,
+    }
+
+    impl FlakyStream {
+        fn new(written: Arc<Mutex<Vec<u8>>>, max_write: usize) -> Self {
+            Self {
+                written,
+                pending_next: false,
+                max_write,
+            }
+        }
+    }
+
+    impl AsyncRead for FlakyStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for FlakyStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            if self.pending_next {
+                self.pending_next = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.pending_next = true;
+
+            let n = buf.len().min(self.max_write);
+            self.written.lock().unwrap().extend_from_slice(&buf[..n]);
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn trojan_datagram_sink_handles_pending_writes() -> io::Result<()> {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let inner: AnyStream = Box::new(FlakyStream::new(written.clone(), 3));
+
+        let mut sink = OutboundDatagramTrojan::new(inner, SocksAddr::any_ipv4());
+
+        let pkt = UdpPacket {
+            data: b"hello-world".to_vec(),
+            src_addr: SocksAddr::any_ipv4(),
+            dst_addr: SocksAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)),
+        };
+
+        sink.send(pkt.clone()).await?;
+
+        let mut expected = BytesMut::new();
+        pkt.dst_addr.write_buf(&mut expected);
+        expected.put_u16(pkt.data.len() as u16);
+        expected.put_slice(b"\r\n");
+        expected.put_slice(&pkt.data);
+
+        assert_eq!(*written.lock().unwrap(), expected.to_vec());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trojan_datagram_stream_reads_multiple_packets_correctly() -> io::Result<()> {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+
+        let mut encoded = BytesMut::new();
+        // Packet 1: 1.2.3.4:53 "hello"
+        encoded.put_u8(SocksAddrType::V4);
+        encoded.put_u32(u32::from(Ipv4Addr::new(1, 2, 3, 4)));
+        encoded.put_u16(53);
+        encoded.put_u16(5);
+        encoded.put_slice(b"\r\n");
+        encoded.put_slice(b"hello");
+        // Packet 2: 8.8.8.8:1234 "abc"
+        encoded.put_u8(SocksAddrType::V4);
+        encoded.put_u32(u32::from(Ipv4Addr::new(8, 8, 8, 8)));
+        encoded.put_u16(1234);
+        encoded.put_u16(3);
+        encoded.put_slice(b"\r\n");
+        encoded.put_slice(b"abc");
+
+        tokio::spawn(async move {
+            let _ = writer.write_all(&encoded).await;
+            let _ = writer.shutdown().await;
+        });
+
+        let inner: AnyStream = Box::new(reader);
+        let mut stream = OutboundDatagramTrojan::new(inner, SocksAddr::any_ipv4());
+
+        let p1 = stream
+            .next()
+            .await
+            .ok_or_else(|| io::Error::other("missing packet 1"))?;
+        assert_eq!(p1.data, b"hello".to_vec());
+        assert_eq!(p1.dst_addr.to_string(), "1.2.3.4:53");
+
+        let p2 = stream
+            .next()
+            .await
+            .ok_or_else(|| io::Error::other("missing packet 2"))?;
+        assert_eq!(p2.data, b"abc".to_vec());
+        assert_eq!(p2.dst_addr.to_string(), "8.8.8.8:1234");
+
+        Ok(())
     }
 }

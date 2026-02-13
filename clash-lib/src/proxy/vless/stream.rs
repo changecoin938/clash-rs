@@ -1,10 +1,12 @@
 use std::{
     io,
+    io::ErrorKind,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use bytes::{BufMut, BytesMut};
+use futures::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, error};
 
@@ -22,6 +24,13 @@ pub struct VlessStream {
     uuid: uuid::Uuid,
     destination: SocksAddr,
     is_udp: bool,
+    handshake_write_buf: BytesMut,
+    handshake_write_pos: usize,
+    first_write_len: usize,
+    response_header: [u8; 2],
+    response_header_read: usize,
+    response_additional: Vec<u8>,
+    response_additional_read: usize,
 }
 
 impl VlessStream {
@@ -45,6 +54,13 @@ impl VlessStream {
             uuid,
             destination: destination.clone(),
             is_udp,
+            handshake_write_buf: BytesMut::new(),
+            handshake_write_pos: 0,
+            first_write_len: 0,
+            response_header: [0; 2],
+            response_header_read: 0,
+            response_additional: Vec::new(),
+            response_additional_read: 0,
         })
     }
 
@@ -69,82 +85,120 @@ impl VlessStream {
         buf
     }
 
-    async fn send_handshake_with_data(&mut self, data: &[u8]) -> io::Result<usize> {
+    fn poll_send_handshake(
+        &mut self,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
         if self.handshake_sent {
-            return Ok(0);
+            return Poll::Ready(Ok(0));
         }
 
-        debug!(
-            "VLESS handshake starting for destination: {}",
-            self.destination
-        );
+        if self.handshake_write_buf.is_empty() && self.handshake_write_pos == 0 {
+            debug!(
+                "VLESS handshake starting for destination: {}",
+                self.destination
+            );
+            self.handshake_write_buf = self.build_handshake_header();
+            self.handshake_write_buf.put_slice(data);
+            self.first_write_len = data.len();
+        }
 
-        let mut buf = self.build_handshake_header();
-        buf.put_slice(data);
-
-        // Send handshake + first data
-        tokio::io::AsyncWriteExt::write_all(&mut self.inner, &buf)
-            .await
-            .map_err(|e| {
-                error!("Failed to send VLESS handshake: {}", e);
-                e
-            })?;
+        while self.handshake_write_pos < self.handshake_write_buf.len() {
+            let n = ready!(Pin::new(&mut self.inner).poll_write(
+                cx,
+                &self.handshake_write_buf[self.handshake_write_pos..],
+            ))?;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    ErrorKind::WriteZero,
+                    "failed to write VLESS handshake",
+                )));
+            }
+            self.handshake_write_pos += n;
+        }
 
         self.handshake_sent = true;
-        debug!("VLESS handshake sent with {} bytes of data", data.len());
+        self.handshake_write_buf.clear();
+        self.handshake_write_pos = 0;
+        debug!(
+            "VLESS handshake sent with {} bytes of data",
+            self.first_write_len
+        );
 
-        Ok(data.len())
+        Poll::Ready(Ok(self.first_write_len))
     }
 
-    async fn receive_response(&mut self) -> io::Result<()> {
+    fn poll_receive_response(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         if self.response_received {
-            return Ok(());
+            return Poll::Ready(Ok(()));
         }
 
-        debug!("VLESS waiting for response");
-
-        // Read response (VLESS response is just version + additional info length +
-        // additional info)
-        let mut response = [0u8; 2];
-        tokio::io::AsyncReadExt::read_exact(&mut self.inner, &mut response)
-            .await
-            .map_err(|e| {
-                error!("Failed to read VLESS response: {}", e);
-                e
-            })?;
-
-        if response[0] != VLESS_VERSION {
-            error!("Invalid VLESS response version: {}", response[0]);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid VLESS response version: {}", response[0]),
-            ));
+        while self.response_header_read < self.response_header.len() {
+            let mut read_buf =
+                ReadBuf::new(&mut self.response_header[self.response_header_read..]);
+            ready!(Pin::new(&mut self.inner).poll_read(cx, &mut read_buf))?;
+            let n = read_buf.filled().len();
+            if n == 0 {
+                error!("Failed to read VLESS response: unexpected EOF");
+                return Poll::Ready(Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "unexpected EOF while reading VLESS response header",
+                )));
+            }
+            self.response_header_read += n;
         }
 
-        let additional_info_len = response[1];
+        if self.response_header[0] != VLESS_VERSION {
+            error!(
+                "Invalid VLESS response version: {}",
+                self.response_header[0]
+            );
+            return Poll::Ready(Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "invalid VLESS response version: {}",
+                    self.response_header[0]
+                ),
+            )));
+        }
 
+        let additional_info_len = self.response_header[1] as usize;
+        if self.response_additional.len() != additional_info_len {
+            self.response_additional.resize(additional_info_len, 0);
+            self.response_additional_read = 0;
+        }
+
+        while self.response_additional_read < additional_info_len {
+            let mut read_buf = ReadBuf::new(
+                &mut self.response_additional[self.response_additional_read..],
+            );
+            ready!(Pin::new(&mut self.inner).poll_read(cx, &mut read_buf))?;
+            let n = read_buf.filled().len();
+            if n == 0 {
+                error!("Failed to read VLESS additional info: unexpected EOF");
+                return Poll::Ready(Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "unexpected EOF while reading VLESS additional info",
+                )));
+            }
+            self.response_additional_read += n;
+        }
+
+        self.response_received = true;
+        self.handshake_done = true;
         if additional_info_len > 0 {
-            let mut additional_info = vec![0u8; additional_info_len as usize];
-            tokio::io::AsyncReadExt::read_exact(
-                &mut self.inner,
-                &mut additional_info,
-            )
-            .await
-            .map_err(|e| {
-                error!("Failed to read VLESS additional info: {}", e);
-                e
-            })?;
             debug!(
                 "VLESS additional info received: {} bytes",
                 additional_info_len
             );
         }
-
-        self.response_received = true;
-        self.handshake_done = true;
         debug!("VLESS handshake completed successfully");
 
-        Ok(())
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -156,13 +210,7 @@ impl AsyncRead for VlessStream {
     ) -> Poll<io::Result<()>> {
         // Must receive response before reading
         if self.handshake_sent && !self.response_received {
-            let fut = self.receive_response();
-            tokio::pin!(fut);
-            match fut.poll(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+            ready!(self.poll_receive_response(cx))?;
         }
 
         Pin::new(&mut self.inner).poll_read(cx, buf)
@@ -177,13 +225,7 @@ impl AsyncWrite for VlessStream {
     ) -> Poll<Result<usize, io::Error>> {
         // Send handshake with first write
         if !self.handshake_sent {
-            let fut = self.send_handshake_with_data(buf);
-            tokio::pin!(fut);
-            match fut.poll(cx) {
-                Poll::Ready(Ok(n)) => return Poll::Ready(Ok(n)),
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+            return self.poll_send_handshake(cx, buf);
         }
 
         Pin::new(&mut self.inner).poll_write(cx, buf)

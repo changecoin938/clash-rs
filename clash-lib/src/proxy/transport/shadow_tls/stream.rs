@@ -2,7 +2,6 @@ use byteorder::{BigEndian, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use std::{
     pin::Pin,
-    ptr::{copy, copy_nonoverlapping},
     task::{Poll, ready},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -132,13 +131,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for ProxyTlsStream<S> {
                                 && body[0] == SERVER_HELLO
                             {
                                 let mut server_random = [0; TLS_RANDOM_SIZE];
-                                unsafe {
-                                    copy_nonoverlapping(
-                                        body.as_ptr().add(SERVER_RANDOM_OFFSET),
-                                        server_random.as_mut_ptr(),
-                                        TLS_RANDOM_SIZE,
-                                    )
-                                }
+                                server_random.copy_from_slice(
+                                    &body[SERVER_RANDOM_OFFSET
+                                        ..SERVER_RANDOM_OFFSET + TLS_RANDOM_SIZE],
+                                );
                                 let hmac =
                                     Hmac::new(&this.password, (&server_random, &[]));
                                 let key = kdf(&this.password, &server_random);
@@ -161,13 +157,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for ProxyTlsStream<S> {
                                     // 1. xor to the the original data
                                     xor_slice(&mut body[HMAC_SIZE..], key);
                                     // 2. remove the hmac
-                                    unsafe {
-                                        copy(
-                                            body.as_ptr().add(HMAC_SIZE),
-                                            body.as_mut_ptr(),
-                                            body.len() - HMAC_SIZE,
-                                        )
-                                    };
+                                    body.copy_within(HMAC_SIZE.., 0);
                                     // 3. rewrite the data size in the header
                                     (&mut header[3..5])
                                         .write_u16::<BigEndian>(
@@ -177,9 +167,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for ProxyTlsStream<S> {
                                     this.read_authorized = true;
                                     // 4. rewrite the body length to be put into the
                                     //    read buf
-                                    unsafe {
-                                        body.set_len(body.len() - HMAC_SIZE);
-                                    }
+                                    body.truncate(body.len() - HMAC_SIZE);
                                     // 4. put the header and body into our own
                                     //    read buf
                                 } else {
@@ -392,13 +380,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VerifiedStream<S> {
                     this.client_cert.update(buf);
                     let hmac_val = this.client_cert.finalize();
                     this.client_cert.update(&hmac_val);
-                    unsafe {
-                        copy_nonoverlapping(
-                            hmac_val.as_ptr(),
-                            header_body.as_mut_ptr().add(TLS_HEADER_SIZE),
-                            HMAC_SIZE,
-                        )
-                    };
+                    header_body[TLS_HEADER_SIZE..TLS_HEADER_SIZE + HMAC_SIZE]
+                        .copy_from_slice(&hmac_val);
 
                     this.write_buf.put_slice(&header_body);
                     this.write_state =

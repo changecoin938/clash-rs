@@ -61,7 +61,7 @@ impl Burtal {
                 lost: 0,
                 ack: 0,
             }; SLOT_COUNT as usize],
-            ack_rate: 0.0,
+            ack_rate: 1.0,
             bps,
             rtt: 0,
             last_send_time: None,
@@ -72,7 +72,11 @@ impl Burtal {
     }
 
     fn get_bandwidth(&self) -> f64 {
-        self.bps as f64 / self.ack_rate
+        if self.ack_rate <= f64::EPSILON {
+            self.bps as f64
+        } else {
+            self.bps as f64 / self.ack_rate
+        }
     }
 }
 
@@ -90,8 +94,10 @@ impl Controller for Burtal {
             if self.rtt == 0 {
                 return 10240;
             }
-            ((self.bps * self.rtt * CONGESTION_WINDOW_MULTIPLIER) as f64
-                / self.ack_rate) as u64
+            ((self.bps as f64
+                * (self.rtt as f64 / 1000.0)
+                * CONGESTION_WINDOW_MULTIPLIER as f64)
+                / self.ack_rate.max(MIN_ACKRATE)) as u64
         } else {
             0
         }
@@ -105,9 +111,11 @@ impl Controller for Burtal {
         let budget = if self.last_send_time.is_none() {
             max
         } else {
+            let elapsed = now
+                .duration_since(self.last_send_time.unwrap())
+                .as_secs_f64();
             let budget = self.budget_at_last_sent.saturating_add(
-                now.duration_since(self.last_send_time.unwrap()).as_secs()
-                    * self.get_bandwidth() as u64,
+                (elapsed * self.get_bandwidth()) as u64,
             );
 
             max.min(budget as f64)
@@ -137,13 +145,13 @@ impl Controller for Burtal {
 
     fn on_congestion_event(
         &mut self,
-        _now: Instant,
-        sent: Instant,
+        now: Instant,
+        _sent: Instant,
         _is_persistent_congestion: bool,
         _lost_bytes: u64,
     ) {
         let current_lost_packet_num = self.sess.stats().path.lost_packets;
-        let t = sent.elapsed().as_secs();
+        let t = now.duration_since(self.send_now).as_secs();
         let idx = (t % SLOT_COUNT) as usize;
         if self.slots[idx].time != t {
             self.slots[idx].time = t;
@@ -154,20 +162,21 @@ impl Controller for Burtal {
             self.slots[idx].time = t;
             self.slots[idx].lost +=
                 current_lost_packet_num - self.last_lost_packet_num;
-            self.ack += self.ack;
+            self.slots[idx].ack += self.ack;
         }
 
         self.last_lost_packet_num = current_lost_packet_num;
         self.ack = 0;
 
-        let (ack, lost) = self.slots.iter().filter(|x| x.time < 5).fold(
-            (0, 0),
-            |(mut ack, mut lost), x| {
+        let (ack, lost) = self
+            .slots
+            .iter()
+            .filter(|x| t.saturating_sub(x.time) < SLOT_COUNT)
+            .fold((0, 0), |(mut ack, mut lost), x| {
                 ack += x.ack;
                 lost += x.lost;
                 (ack, lost)
-            },
-        );
+            });
 
         self.ack_rate = if ack + lost < MIN_SAMPLE_COUNT {
             1.0
@@ -187,16 +196,29 @@ impl Controller for Burtal {
         _app_limited: bool,
         rtt: &quinn_proto::RttEstimator,
     ) {
-        self.rtt = rtt.get().as_secs();
+        self.rtt = rtt.get().as_millis() as u64;
         self.ack += 1;
     }
 
     fn clone_box(&self) -> Box<dyn Controller> {
-        unreachable!()
+        Box::new(Self {
+            ack: self.ack,
+            last_lost_packet_num: self.last_lost_packet_num,
+            slots: self.slots,
+            ack_rate: self.ack_rate,
+            bps: self.bps,
+            max_datagram_size: self.max_datagram_size,
+            last_send_time: self.last_send_time,
+            budget_at_last_sent: self.budget_at_last_sent,
+            rtt: self.rtt,
+            in_flight: self.in_flight,
+            send_now: self.send_now,
+            sess: self.sess.clone(),
+        })
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
-        unreachable!()
+        self
     }
 }
 

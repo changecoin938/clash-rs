@@ -1,6 +1,5 @@
 use std::{
     io::IoSliceMut,
-    ops::DerefMut,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -53,11 +52,12 @@ impl SalamanderObfs {
     }
 
     fn decrypt(&self, data: &mut [u8]) {
-        assert!(data.len() > 8, "data len must > 8");
+        if data.len() <= 8 {
+            return;
+        }
 
         let (salt, data) = data.split_at_mut(8);
         self.obfs(salt, data);
-        // data.advance(8); // sadlly IoSliceMut::advance is unstable
     }
 }
 
@@ -93,9 +93,9 @@ impl AsyncUdpSocket for Salamander {
 
     fn try_send(&self, transmit: &Transmit) -> std::io::Result<()> {
         let mut v = transmit.to_owned();
-        // TODO: encrypt in place
-        let x = self.obfs.encrypt(&mut v.contents.to_vec());
-        v.contents = &x;
+        let mut payload = v.contents.to_vec();
+        let encrypted = self.obfs.encrypt(&mut payload);
+        v.contents = encrypted.as_ref();
         self.inner.try_send(&v)
     }
 
@@ -116,16 +116,10 @@ impl AsyncUdpSocket for Salamander {
             .take(packet_nums)
             .filter(|(_, meta)| meta.len > 8)
             .for_each(|(v, meta)| {
-                let x = &mut v.deref_mut()[..meta.len];
+                let x = &mut v[..meta.len];
                 // decrypt in place, and drop first 8 bytes
                 self.obfs.decrypt(x);
-                let data = &mut x[8..];
-                unsafe {
-                    //  because IoSliceMut is transparent and .0 is also transparent, so it is a &[u8]
-                    let b: IoSliceMut<'_> = std::mem::transmute(data);
-                    *v = b;
-                }
-                // MUST update meta.len
+                x.copy_within(8..meta.len, 0);
                 meta.len -= 8;
             });
 

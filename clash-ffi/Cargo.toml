@@ -6,6 +6,7 @@ edition = { workspace = true }
 
 [dependencies]
 clash-lib = { path = "../clash-lib",  features = ["shadowsocks", "tuic", "ssh", "zero_copy"] }
+once_cell = "1.21.3"
 
 [lib]
 name = "clashrs"

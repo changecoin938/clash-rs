@@ -234,16 +234,25 @@ where
         addr: SocksAddr,
         max_pkt_size: usize,
         payload: P,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let addr = addr.to_string().into_bytes();
         let addr_var = VarInt::from_u32(addr.len() as u32);
 
         let fixed_size = 4 + 2 + 1 + 1 + addr.len() + var_size(addr_var);
+        if max_pkt_size <= fixed_size {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "hysteria2 max packet size too small: max={max_pkt_size}, \
+                     fixed={fixed_size}"
+                ),
+            ));
+        }
         let max_data_size = max_pkt_size - fixed_size;
         // TODO: report warning when frag_total > u8::MAX
         let frag_total = payload.as_ref().len().div_ceil(max_data_size) as u8;
 
-        Self {
+        Ok(Self {
             session_id,
             pkt_id,
             addr: (addr, addr_var),
@@ -254,7 +263,7 @@ where
             max_pkt_size,
             fixed_size,
             _marker: std::marker::PhantomData,
-        }
+        })
     }
 }
 

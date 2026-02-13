@@ -119,7 +119,9 @@ fn setup_logging_inner(
     cwd: &str,
     log_file: Option<String>,
 ) -> anyhow::Result<Option<LoggingGuard>> {
-    let default_log_level = format!("warn,clash={level}");
+    // `tracing` targets in this workspace are mostly under `clash_lib::*`.
+    // Keep the default noise low, but honor the configured level for clash code.
+    let default_log_level = format!("warn,clash_lib={level},clash={level}");
     let filter = EnvFilter::try_from_default_env()
         .inspect(|f| {
             eprintln!("using env log level: {f}");
@@ -139,7 +141,10 @@ fn setup_logging_inner(
         } else {
             format!("{cwd}/{log_file}")
         };
-        let writer = std::fs::File::options().append(true).open(log_path)?;
+        let writer = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
         let (non_blocking, guard) =
             tracing_appender::non_blocking::NonBlockingBuilder::default()
                 .buffered_lines_limit(16_000)

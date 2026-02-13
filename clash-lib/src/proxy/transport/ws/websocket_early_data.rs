@@ -121,7 +121,9 @@ impl AsyncRead for WebsocketEarlyDataConn {
         }
         let pin = self.get_mut();
         match &mut pin.stream {
-            None => unreachable!("bad state"),
+            None => Poll::Ready(Err(new_io_error(
+                "msg: websocket early data bad state",
+            ))),
             Some(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -176,7 +178,9 @@ impl AsyncWrite for WebsocketEarlyDataConn {
         }
 
         match &mut self.as_mut().stream {
-            None => unreachable!("bad state"),
+            None => Poll::Ready(Err(new_io_error(
+                "msg: websocket early data bad state",
+            ))),
             Some(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
@@ -192,7 +196,9 @@ impl AsyncWrite for WebsocketEarlyDataConn {
             return Poll::Pending;
         }
         match &mut self.stream {
-            None => unreachable!("bad state"),
+            None => Poll::Ready(Err(new_io_error(
+                "msg: websocket early data bad state",
+            ))),
             Some(s) => Pin::new(s).poll_flush(cx),
         }
     }
@@ -206,7 +212,9 @@ impl AsyncWrite for WebsocketEarlyDataConn {
         }
         let pin = self.get_mut();
         match &mut pin.stream {
-            None => unreachable!("bad state"),
+            None => Poll::Ready(Err(new_io_error(
+                "msg: websocket early data bad state",
+            ))),
             Some(s) => Pin::new(s).poll_shutdown(cx),
         }
     }

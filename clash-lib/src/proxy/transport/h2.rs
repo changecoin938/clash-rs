@@ -4,12 +4,17 @@ use futures::ready;
 use h2::{RecvStream, SendStream};
 use http::Request;
 use rand::Rng;
-use std::{collections::HashMap, fmt::Debug, io};
+use std::{collections::HashMap, fmt::Debug, io, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::error;
+use tracing::{error, warn};
 
 use super::Transport;
 use crate::{common::errors::map_io_error, proxy::AnyStream};
+
+// Keep flow-control enabled to avoid bufferbloat on shared HTTP/2 connections.
+const H2_STREAM_WINDOW_SIZE: u32 = 2 * 1024 * 1024; // 2 MiB
+const H2_CONNECTION_WINDOW_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB
+const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct Client {
     pub hosts: Vec<String>,
@@ -62,16 +67,41 @@ impl Client {
 #[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> std::io::Result<AnyStream> {
-        let (mut client, h2) =
-            h2::client::handshake(stream).await.map_err(map_io_error)?;
+        let (mut client, mut h2) = h2::client::Builder::new()
+            .initial_connection_window_size(H2_CONNECTION_WINDOW_SIZE)
+            .initial_window_size(H2_STREAM_WINDOW_SIZE)
+            .initial_max_send_streams(1024)
+            .enable_push(false)
+            .handshake(stream)
+            .await
+            .map_err(map_io_error)?;
+
+        let ping_pong = h2.ping_pong();
         let req = self.req()?;
-        let (resp, send_stream) =
-            client.send_request(req, false).map_err(map_io_error)?;
+
         tokio::spawn(async move {
             if let Err(e) = h2.await {
                 error!("h2 error: {}", e);
             }
         });
+
+        if let Some(mut ping_pong) = ping_pong {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(H2_KEEPALIVE_INTERVAL);
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = ping_pong.ping(h2::Ping::opaque()).await {
+                        warn!("h2 ping error: {e}");
+                        break;
+                    }
+                }
+            });
+        }
+
+        client = client.ready().await.map_err(map_io_error)?;
+        let (resp, send_stream) =
+            client.send_request(req, false).map_err(map_io_error)?;
 
         let recv_stream = resp.await.map_err(map_io_error)?.into_body();
 
@@ -83,6 +113,7 @@ pub struct Http2Stream {
     recv: RecvStream,
     send: SendStream<Bytes>,
     buffer: BytesMut,
+    pending_release: usize,
     shutdown_sent: bool,
 }
 
@@ -102,6 +133,7 @@ impl Http2Stream {
             recv,
             send,
             buffer: BytesMut::with_capacity(1024 * 4),
+            pending_release: 0,
             shutdown_sent: false,
         }
     }
@@ -117,6 +149,22 @@ impl AsyncRead for Http2Stream {
             let to_read = std::cmp::min(self.buffer.len(), buf.remaining());
             let data = self.buffer.split_to(to_read);
             buf.put_slice(&data[..to_read]);
+            if self.pending_release > 0 {
+                let release = to_read.min(self.pending_release);
+                if release > 0 {
+                    if let Err(e) =
+                        self.recv.flow_control().release_capacity(release)
+                    {
+                        return std::task::Poll::Ready(Err(
+                            std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                e,
+                            ),
+                        ));
+                    }
+                    self.pending_release -= release;
+                }
+            }
             return std::task::Poll::Ready(Ok(()));
         }
         std::task::Poll::Ready(match ready!(self.recv.poll_data(cx)) {
@@ -125,19 +173,24 @@ impl AsyncRead for Http2Stream {
                 buf.put_slice(&data[..to_read]);
                 if to_read < data.len() {
                     self.buffer.extend_from_slice(&data[to_read..]);
+                    self.pending_release += data.len() - to_read;
                 }
-                self.recv
-                    .flow_control()
-                    .release_capacity(to_read)
-                    .map_or_else(
-                        |e| {
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionReset,
-                                e,
-                            ))
-                        },
-                        |_| Ok(()),
-                    )
+                if to_read == 0 {
+                    Ok(())
+                } else {
+                    self.recv
+                        .flow_control()
+                        .release_capacity(to_read)
+                        .map_or_else(
+                            |e| {
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    e,
+                                ))
+                            },
+                            |_| Ok(()),
+                        )
+                }
             }
             Some(Err(e)) => Err(io::Error::new(io::ErrorKind::ConnectionReset, e)),
             None => Ok(()),

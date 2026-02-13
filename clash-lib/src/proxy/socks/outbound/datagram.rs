@@ -97,25 +97,22 @@ impl Stream for Socks5Datagram {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let pin = self.get_mut();
-        pin.inner.poll_next_unpin(cx).map(|opt| {
-            opt.map(|res| match res {
-                Ok(((src, data), dst)) => {
-                    trace!("received UDP packet from {} to {}", src, dst,);
-                    UdpPacket {
-                        src_addr: src,
-                        dst_addr: SocksAddr::Ip(dst),
-                        data: data.into(),
-                    }
-                }
-                Err(_) => {
-                    error!("failed to decode UDP packet from remote");
-                    UdpPacket {
-                        src_addr: SocksAddr::any_ipv4(),
-                        dst_addr: SocksAddr::any_ipv4(),
-                        data: Vec::new(),
-                    }
-                }
-            })
-        })
+        match pin.inner.poll_next_unpin(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(((src, data), dst)))) => {
+                trace!("received UDP packet from {} to {}", src, dst);
+                Poll::Ready(Some(UdpPacket {
+                    src_addr: src,
+                    dst_addr: SocksAddr::Ip(dst),
+                    data: data.into(),
+                }))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                error!("failed to decode UDP packet from remote: {e}");
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+        }
     }
 }

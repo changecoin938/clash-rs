@@ -5,7 +5,7 @@ use crate::{
     config::internal::proxy::OutboundVmess,
     proxy::{
         HandlerCommonOptions,
-        transport::{GrpcClient, H2Client, TlsClient, WsClient, XHttpClient},
+        transport::{GrpcPooledClient, H2Client, TlsClient, WsClient, XHttpClient},
         vmess::{Handler, HandlerOptions},
     },
 };
@@ -61,117 +61,165 @@ impl TryFrom<&OutboundVmess> for Handler {
             alter_id: s.alter_id,
             security: s.cipher.clone().unwrap_or_default(),
             udp: s.udp.unwrap_or(true),
-            transport: s
-                .network
-                .clone()
-                .filter(|x| x != "tcp" && !x.is_empty())
-                .map(|x| match x.as_str() {
-                    "tcp_http" => s
-                        .tcp_http_opts
-                        .as_ref()
-                        .ok_or(Error::InvalidConfig(
+            transport: {
+                let network = s
+                    .network
+                    .as_deref()
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty() && *x != "tcp");
+                match network {
+                    Some("tcp_http") => Some({
+                        let opt = s.tcp_http_opts.as_ref().ok_or(Error::InvalidConfig(
                             "tcp-http-opts is required for tcp_http".to_owned(),
-                        ))
-                        .and_then(|x| {
-                            let client: TcpHttpClient =
-                                (x, &s.common_opts).try_into().map_err(|e| {
-                                    Error::InvalidConfig(format!(
-                                        "invalid tcp_http options: {e}"
-                                    ))
-                                })?;
-                            Ok(Box::new(client) as _)
-                        }),
-                    "ws" => s
-                        .ws_opts
-                        .as_ref()
-                        .ok_or(Error::InvalidConfig(
+                        ))?;
+                        let client: TcpHttpClient =
+                            (opt, &s.common_opts).try_into().map_err(|e| {
+                                Error::InvalidConfig(format!(
+                                    "invalid tcp_http options: {e}"
+                                ))
+                            })?;
+                        Box::new(client) as _
+                    }),
+                    Some("ws") => Some({
+                        let opt = s.ws_opts.as_ref().ok_or(Error::InvalidConfig(
                             "ws_opts is required for ws".to_owned(),
-                        ))
-                        .and_then(|x| {
-                            let client: WsClient =
-                                (x, &s.common_opts).try_into().map_err(|e| {
-                                    Error::InvalidConfig(format!("invalid ws options: {e}"))
-                                })?;
-                            Ok(Box::new(client) as _)
-                        }),
-                    "h2" => s
-                        .h2_opts
-                        .as_ref()
-                        .ok_or(Error::InvalidConfig(
+                        ))?;
+                        let client: WsClient = (opt, &s.common_opts)
+                            .try_into()
+                            .map_err(|e| {
+                                Error::InvalidConfig(format!(
+                                    "invalid ws options: {e}"
+                                ))
+                            })?;
+                        Box::new(client) as _
+                    }),
+                    Some("h2") => Some({
+                        let opt = s.h2_opts.as_ref().ok_or(Error::InvalidConfig(
                             "h2_opts is required for h2".to_owned(),
-                        ))
-                        .and_then(|x| {
-                            let client: H2Client =
-                                (x, &s.common_opts).try_into().map_err(|e| {
-                                    Error::InvalidConfig(format!("invalid h2 options: {e}"))
-                                })?;
-                            Ok(Box::new(client) as _)
-                        }),
-                    "grpc" => s
-                        .grpc_opts
-                        .as_ref()
-                        .ok_or(Error::InvalidConfig(
-                            "grpc_opts is required for grpc".to_owned(),
-                        ))
-                        .and_then(|x| {
-                            let client: GrpcClient =
-                                (s.server_name.clone(), x, &s.common_opts)
-                                    .try_into()
-                                    .map_err(|e| {
-                                        Error::InvalidConfig(format!(
-                                            "invalid grpc options: {e}"
-                                        ))
-                                    })?;
-                            Ok(Box::new(client) as _)
-                        }),
-                    "xhttp" => {
+                        ))?;
+                        let client: H2Client =
+                            (opt, &s.common_opts).try_into().map_err(|e| {
+                                Error::InvalidConfig(format!(
+                                    "invalid h2 options: {e}"
+                                ))
+                            })?;
+                        Box::new(client) as _
+                    }),
+                    Some("xhttp") => {
                         if !s.tls.unwrap_or_default() {
                             return Err(Error::InvalidConfig(
                                 "xhttp requires tls: true".to_owned(),
                             ));
                         }
-                        s.xhttp_opts
-                            .as_ref()
-                            .ok_or(Error::InvalidConfig(
-                                "xhttp-opts is required for xhttp".to_owned(),
-                            ))
-                            .and_then(|x| {
-                                if let Some(mode) = x.mode.as_deref().filter(|x| !x.is_empty()) {
-                                    let mode = mode.to_ascii_lowercase();
-                                    if mode != "auto"
-                                        && mode != "packet"
-                                        && mode != "packet-up"
-                                        && mode != "packet_up"
-                                        && mode != "stream"
-                                        && mode != "stream-up"
-                                        && mode != "stream_up"
-                                        && mode != "stream-one"
-                                        && mode != "stream_one"
-                                    {
-                                        return Err(Error::InvalidConfig(format!(
-                                            "unsupported xhttp mode: {mode}"
-                                        )));
-                                    }
-                                }
+                        Some({
+                            let opt =
+                                s.xhttp_opts.as_ref().ok_or(Error::InvalidConfig(
+                                    "xhttp-opts is required for xhttp".to_owned(),
+                                ))?;
 
-                                let client: XHttpClient =
-                                    (s.server_name.clone(), x, &s.common_opts)
-                                        .try_into()
-                                        .map_err(|e| {
-                                            Error::InvalidConfig(format!(
-                                                "invalid xhttp options: {e}"
-                                            ))
-                                        })?;
-                                Ok(Box::new(client) as _)
-                            })
+                            if let Some(mode) =
+                                opt.mode.as_deref().filter(|x| !x.is_empty())
+                            {
+                                let mode = mode.to_ascii_lowercase();
+                                if mode != "auto"
+                                    && mode != "packet"
+                                    && mode != "packet-up"
+                                    && mode != "packet_up"
+                                    && mode != "stream"
+                                    && mode != "stream-up"
+                                    && mode != "stream_up"
+                                    && mode != "stream-one"
+                                    && mode != "stream_one"
+                                {
+                                    return Err(Error::InvalidConfig(format!(
+                                        "unsupported xhttp mode: {mode}"
+                                    )));
+                                }
+                            }
+
+                            let client: XHttpClient =
+                                (s.server_name.clone(), opt, &s.common_opts)
+                                    .try_into()
+                                    .map_err(|e| {
+                                        Error::InvalidConfig(format!(
+                                            "invalid xhttp options: {e}"
+                                        ))
+                                    })?;
+                            Box::new(client) as _
+                        })
                     }
-                    _ => Err(Error::InvalidConfig(format!(
-                        "unsupported network: {x}"
-                    ))),
-                })
-                .transpose()?,
+                    Some("grpc") => None,
+                    Some(other) => {
+                        return Err(Error::InvalidConfig(format!(
+                            "unsupported network: {other}"
+                        )));
+                    }
+                    None => None,
+                }
+            },
+            grpc: {
+                let network = s
+                    .network
+                    .as_deref()
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty() && *x != "tcp");
+                match network {
+                    Some("grpc") => {
+                        let opt = s.grpc_opts.as_ref().ok_or(Error::InvalidConfig(
+                            "grpc_opts is required for grpc".to_owned(),
+                        ))?;
+                        let host = s
+                            .server_name
+                            .as_ref()
+                            .filter(|x| !x.is_empty())
+                            .cloned()
+                            .unwrap_or(s.common_opts.server.to_owned());
+                        Some(GrpcPooledClient::new(
+                            host,
+                            opt.grpc_service_name.clone().unwrap_or_default(),
+                            opt.mode.clone(),
+                            s.tls.unwrap_or_default(),
+                        ))
+                    }
+                    _ => None,
+                }
+            },
             tls: match s.tls.unwrap_or_default() {
                 true => {
+                    let alpn = s.alpn.clone().map(|list| {
+                        list.into_iter()
+                            .map(|v| v.trim().to_owned())
+                            .filter(|v| !v.is_empty())
+                            .collect::<Vec<_>>()
+                    });
+                    let default_alpn = s
+                        .network
+                        .as_ref()
+                        .map(|x| match x.as_str() {
+                            "tcp" => Ok(vec![]),
+                            "tcp_http" => Ok(vec!["http/1.1".to_owned()]),
+                            "ws" => Ok(vec!["http/1.1".to_owned()]),
+                            "http" => Ok(vec![]),
+                            "xhttp" => Ok(vec!["h2".to_owned()]),
+                            "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
+                            _ => Err(Error::InvalidConfig(format!(
+                                "unsupported network: {x}"
+                            ))),
+                        })
+                        .transpose()?;
+                    let mut alpn = alpn
+                        .filter(|list| !list.is_empty())
+                        .or(default_alpn);
+                    if let Some(required) = match s.network.as_deref() {
+                        Some("xhttp") | Some("h2") | Some("grpc") => Some("h2"),
+                        Some("ws") | Some("tcp_http") => Some("http/1.1"),
+                        _ => None,
+                    } && let Some(list) = alpn.as_mut()
+                    {
+                        if !list.iter().any(|v| v == required) {
+                            list.push(required.to_owned());
+                        }
+                    }
                     let sni = s
                         .server_name
                         .as_ref()
@@ -200,20 +248,7 @@ impl TryFrom<&OutboundVmess> for Handler {
                     let mut client = TlsClient::new(
                         effective_skip_cert_verify,
                         sni,
-                        s.network
-                            .as_ref()
-                            .map(|x| match x.as_str() {
-                                "tcp" => Ok(vec![]),
-                                "tcp_http" => Ok(vec!["http/1.1".to_owned()]),
-                                "ws" => Ok(vec!["http/1.1".to_owned()]),
-                                "http" => Ok(vec![]),
-                                "xhttp" => Ok(vec!["h2".to_owned()]),
-                                "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
-                                _ => Err(Error::InvalidConfig(format!(
-                                    "unsupported network: {x}"
-                                ))),
-                            })
-                            .transpose()?,
+                        alpn,
                         match s.network.as_deref() {
                             Some("xhttp") | Some("h2") | Some("grpc") => {
                                 Some("h2".to_owned())

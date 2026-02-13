@@ -140,8 +140,14 @@ impl Transport for Client {
                 .map_err(map_io_error)?;
 
         let c = connector.connect(dns_name, stream).await.and_then(|x| {
+            // Some REALITY targets intentionally omit ALPN to mimic a real site,
+            // yet still speak HTTP/2 for transports like gRPC/XHTTP.
+            //
+            // Therefore we only enforce ALPN if the server *negotiated one* and
+            // it doesn't match what the transport expects.
             if let Some(expected_alpn) = self.expected_alpn.as_ref()
-                && x.get_ref().1.alpn_protocol() != Some(expected_alpn.as_bytes())
+                && let Some(negotiated) = x.get_ref().1.alpn_protocol()
+                && negotiated != expected_alpn.as_bytes()
             {
                 return Err(io::Error::other(format!(
                     "unexpected alpn protocol: {:?}, expected: {:?}",

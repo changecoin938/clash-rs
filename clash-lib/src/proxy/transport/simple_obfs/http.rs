@@ -115,8 +115,9 @@ impl AsyncRead for HTTPObfs {
         if !pin.read_buf.is_empty() {
             let to_read = std::cmp::min(buf.remaining(), pin.read_buf.len());
             if to_read == 0 {
-                assert!(buf.remaining() > 0);
-                return std::task::Poll::Pending;
+                // `AsyncRead::poll_read` can be called with a zero-length buffer.
+                // In that case, report success without consuming internal data.
+                return std::task::Poll::Ready(Ok(()));
             }
 
             let data = pin.read_buf.split_to(to_read);

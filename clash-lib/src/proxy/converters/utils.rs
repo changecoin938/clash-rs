@@ -12,9 +12,11 @@ impl TryFrom<(&WsOpt, &CommonConfigOptions)> for WsClient {
 
     fn try_from(pair: (&WsOpt, &CommonConfigOptions)) -> Result<Self, Self::Error> {
         let (x, common) = pair;
-        let path = x.path.as_ref().map(|x| x.to_owned()).unwrap_or_default();
+        let path = normalize_http_path_and_query(
+            x.path.as_ref().map(|x| x.as_str()).unwrap_or_default(),
+        );
         let headers = x.headers.as_ref().map(|x| x.to_owned()).unwrap_or_default();
-        let max_early_data = x.max_early_data.unwrap_or_default() as usize;
+        let max_early_data = x.max_early_data.unwrap_or_default().max(0) as usize;
         let early_data_header_name = x
             .early_data_header_name
             .as_ref()
@@ -41,14 +43,14 @@ impl TryFrom<(Option<String>, &GrpcOpt, &CommonConfigOptions)> for GrpcClient {
         opt: (Option<String>, &GrpcOpt, &CommonConfigOptions),
     ) -> Result<Self, Self::Error> {
         let (sni, x, common) = opt;
-        let client = transport::GrpcClient::new(
+        let mut client = transport::GrpcClient::new(
             sni.as_ref().unwrap_or(&common.server).to_owned(),
             x.grpc_service_name
                 .as_ref()
                 .map(|x| x.to_owned())
-                .unwrap_or_default()
-                .try_into()?,
+                .unwrap_or_default(),
         );
+        client.set_mode(x.mode.clone());
         Ok(client)
     }
 }
@@ -61,9 +63,12 @@ impl TryFrom<(&H2Opt, &CommonConfigOptions)> for H2Client {
         let host = x
             .host
             .as_ref()
-            .map(|x| x.to_owned())
-            .unwrap_or(vec![common.server.to_owned()]);
-        let path = x.path.as_ref().map(|x| x.to_owned()).unwrap_or_default();
+            .filter(|hosts| !hosts.is_empty())
+            .map(|hosts| hosts.to_owned())
+            .unwrap_or_else(|| vec![common.server.to_owned()]);
+        let path = normalize_http_path_and_query(
+            x.path.as_ref().map(|x| x.as_str()).unwrap_or_default(),
+        );
 
         Ok(H2Client::new(
             host,
@@ -85,13 +90,38 @@ impl TryFrom<(&TcpHttpOpt, &CommonConfigOptions)> for TcpHttpClient {
             .map(|x| x.to_owned())
             .filter(|x| !x.is_empty())
             .unwrap_or(common.server.to_owned());
-        let path = x.path.as_ref().map(|x| x.to_owned()).unwrap_or_default();
+        let path = normalize_http_path_and_query(
+            x.path.as_ref().map(|x| x.as_str()).unwrap_or_default(),
+        );
 
-        Ok(TcpHttpClient::new(
-            host,
-            path.try_into()?,
-        ))
+        let mut client = TcpHttpClient::new(host, path.try_into()?);
+        if let Some(headers) = x.headers.as_ref().filter(|h| !h.is_empty()) {
+            client.set_headers(headers.to_owned());
+        }
+        Ok(client)
     }
+}
+
+fn normalize_http_path_and_query(path_and_query: &str) -> String {
+    let (path, query) = path_and_query
+        .split_once('?')
+        .map(|(p, q)| (p, Some(q)))
+        .unwrap_or((path_and_query, None));
+
+    let mut normalized = if path.is_empty() {
+        "/".to_owned()
+    } else if path.starts_with('/') || path.starts_with('*') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    };
+
+    if let Some(query) = query {
+        normalized.push('?');
+        normalized.push_str(query);
+    }
+
+    normalized
 }
 
 impl TryFrom<(Option<String>, &XHttpOpt, &CommonConfigOptions)> for XHttpClient {

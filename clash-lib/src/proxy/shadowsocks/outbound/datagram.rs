@@ -224,7 +224,13 @@ impl DatagramSend for ShadowsocksUdpIo {
         buf: &[u8],
         target: std::net::SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        let mut w = self.w.try_lock().expect("must acquire");
+        let mut w = match self.w.try_lock() {
+            Ok(w) => w,
+            Err(_) => {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        };
         match w.start_send_unpin(UdpPacket {
             data: buf.to_vec(),
             src_addr: SocksAddr::any_ipv4(),
@@ -241,7 +247,13 @@ impl DatagramSend for ShadowsocksUdpIo {
     }
 
     fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut w = self.w.try_lock().expect("must acquire");
+        let mut w = match self.w.try_lock() {
+            Ok(w) => w,
+            Err(_) => {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        };
         w.poll_ready_unpin(cx)
             .map_err(|e| new_io_error(e.to_string()))
     }
@@ -253,7 +265,13 @@ impl DatagramReceive for ShadowsocksUdpIo {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut g = self.r.try_lock().expect("must acquire");
+        let mut g = match self.r.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        };
         let (r, remained) = &mut *g;
 
         if !remained.is_empty() {

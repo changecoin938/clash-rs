@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures::ready;
+use futures::{future::poll_fn, ready};
 use h2::{RecvStream, SendStream};
 use http::{Request, StatusCode};
 use rand::Rng;
@@ -14,11 +14,16 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use super::Transport;
 use crate::{common::errors::map_io_error, proxy::AnyStream};
+
+// Keep flow-control enabled to avoid bufferbloat on shared HTTP/2 connections.
+const XHTTP_STREAM_WINDOW_SIZE: u32 = 2 * 1024 * 1024; // 2 MiB
+const XHTTP_CONNECTION_WINDOW_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB
+const XHTTP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -32,7 +37,9 @@ pub struct Client {
     pub headers: HashMap<String, String>,
     pub path: http::uri::PathAndQuery,
     mode: Mode,
-    packet_up_interval: Duration,
+    packet_up_min_interval: Duration,
+    packet_up_max_each_post_bytes: usize,
+    packet_up_max_buffered_posts: usize,
 }
 
 impl Client {
@@ -56,7 +63,13 @@ impl Client {
             headers,
             path,
             mode,
-            packet_up_interval: Duration::from_millis(30),
+            // Align with Xray SplitHTTP defaults:
+            // - scMinPostsIntervalMs: 30ms
+            // - scMaxEachPostBytes: 1_000_000 bytes
+            // - scMaxBufferedPosts: 30
+            packet_up_min_interval: Duration::from_millis(30),
+            packet_up_max_each_post_bytes: 1_000_000,
+            packet_up_max_buffered_posts: 30,
         }
     }
 
@@ -190,14 +203,36 @@ impl Client {
 #[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> std::io::Result<AnyStream> {
-        let (mut client, h2) =
-            h2::client::handshake(stream).await.map_err(map_io_error)?;
+        let (mut client, mut h2) = h2::client::Builder::new()
+            .initial_connection_window_size(XHTTP_CONNECTION_WINDOW_SIZE)
+            .initial_window_size(XHTTP_STREAM_WINDOW_SIZE)
+            .initial_max_send_streams(1024)
+            .enable_push(false)
+            .handshake(stream)
+            .await
+            .map_err(map_io_error)?;
+
+        let ping_pong = h2.ping_pong();
 
         tokio::spawn(async move {
             if let Err(e) = h2.await {
                 error!("xhttp h2 error: {}", e);
             }
         });
+
+        if let Some(mut ping_pong) = ping_pong {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(XHTTP_KEEPALIVE_INTERVAL);
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = ping_pong.ping(h2::Ping::opaque()).await {
+                        warn!("xhttp h2 ping error: {e}");
+                        break;
+                    }
+                }
+            });
+        }
 
         match self.mode {
             Mode::StreamOne => {
@@ -208,6 +243,7 @@ impl Transport for Client {
                     query.as_deref(),
                     None,
                 )?;
+                client = client.ready().await.map_err(map_io_error)?;
                 let (resp, send_stream) =
                     client.send_request(req, false).map_err(map_io_error)?;
 
@@ -236,6 +272,7 @@ impl Transport for Client {
                     base_query.as_deref(),
                     None,
                 )?;
+                client = client.ready().await.map_err(map_io_error)?;
                 let (down_resp, _down_send) =
                     client.send_request(down_req, true).map_err(map_io_error)?;
                 let down_resp = down_resp.await.map_err(map_io_error)?;
@@ -258,6 +295,7 @@ impl Transport for Client {
                     base_query.as_deref(),
                     None,
                 )?;
+                client = client.ready().await.map_err(map_io_error)?;
                 let (up_resp, send_stream) =
                     client.send_request(up_req, false).map_err(map_io_error)?;
 
@@ -290,6 +328,7 @@ impl Transport for Client {
                     base_query.as_deref(),
                     None,
                 )?;
+                client = client.ready().await.map_err(map_io_error)?;
                 let (down_resp, _down_send) =
                     client.send_request(down_req, true).map_err(map_io_error)?;
                 let down_resp = down_resp.await.map_err(map_io_error)?;
@@ -304,138 +343,196 @@ impl Transport for Client {
                 }
                 let recv_stream = down_resp.into_body();
 
-                let (upload_tx, mut upload_rx) = mpsc::channel::<Bytes>(16);
+                let (upload_tx, mut upload_rx) = mpsc::channel::<Bytes>(
+                    self.packet_up_max_buffered_posts,
+                );
 
                 let host = self.host.clone();
                 let headers = self.headers.clone();
-                let packet_up_interval = self.packet_up_interval;
+                let packet_up_min_interval = self.packet_up_min_interval;
+                let max_each_post_bytes = self.packet_up_max_each_post_bytes;
                 let base_path = self.path_with_segments(false, Some(&session_id), None);
                 tokio::spawn(async move {
+                    let mut client = client;
                     let mut seq: u64 = 0;
-                    let mut next_send_at = tokio::time::Instant::now();
-                    while let Some(chunk) = upload_rx.recv().await {
-                        if chunk.is_empty() {
+                    let mut flush_at = tokio::time::Instant::now();
+                    let mut pending = BytesMut::with_capacity(32 * 1024);
+                    let mut closing = false;
+
+                    'packet_up: loop {
+                        if closing && pending.is_empty() {
                             break;
                         }
 
-                        let path = format!("{}/{}", base_path, seq);
-                        seq = seq.saturating_add(1);
-
-                        let now = tokio::time::Instant::now();
-                        if now < next_send_at {
-                            tokio::time::sleep_until(next_send_at).await;
-                        }
-                        next_send_at = tokio::time::Instant::now() + packet_up_interval;
-
-                        // Build request (mirrors `build_request` but avoids borrowing `self`).
-                        let mut rng = rand::rng();
-                        let padding_len: usize = rng.random_range(100..=1000);
-                        let x_padding = "X".repeat(padding_len);
-
-                        let mut path_and_query = path.clone();
-                        if let Some(q) = base_query.as_ref().filter(|q| !q.is_empty()) {
-                            path_and_query.push('?');
-                            path_and_query.push_str(q);
-                            path_and_query.push('&');
-                        } else {
-                            path_and_query.push('?');
-                        }
-                        path_and_query.push_str("x_padding=");
-                        path_and_query.push_str(&x_padding);
-
-                        let referer =
-                            format!("https://{}{}?x_padding={}", host, path, x_padding);
-
-                        let uri = match http::Uri::builder()
-                            .scheme("https")
-                            .authority(host.as_str())
-                            .path_and_query(path_and_query.as_str())
-                            .build()
-                        {
-                            Ok(uri) => uri,
-                            Err(e) => {
-                                error!("xhttp packet build uri error: {e}");
-                                continue;
+                        tokio::select! {
+                            chunk = upload_rx.recv(), if !closing => {
+                                match chunk {
+                                    Some(chunk) if chunk.is_empty() => {
+                                        // EOF: flush whatever is pending immediately.
+                                        closing = true;
+                                        flush_at = tokio::time::Instant::now();
+                                    }
+                                    Some(chunk) => {
+                                        // Enqueue data and let the timer / max_each_post_bytes decide batching.
+                                        pending.extend_from_slice(&chunk);
+                                    }
+                                    None => {
+                                        closing = true;
+                                        flush_at = tokio::time::Instant::now();
+                                    }
+                                }
                             }
-                        };
+                            _ = tokio::time::sleep_until(flush_at), if !pending.is_empty() => {
+                                let to_send_len = std::cmp::min(pending.len(), max_each_post_bytes);
+                                let chunk = pending.split_to(to_send_len).freeze();
 
-                        let mut request = Request::builder()
-                            .uri(uri)
-                            .method(http::Method::POST)
-                            .version(http::Version::HTTP_2);
+                                let path = format!("{}/{}", base_path, seq);
+                                seq = seq.saturating_add(1);
 
-                        let has_user_agent = headers
-                            .keys()
-                            .any(|k| k.eq_ignore_ascii_case("user-agent"));
-                        let has_content_type = headers
-                            .keys()
-                            .any(|k| k.eq_ignore_ascii_case("content-type"));
+                                // Build request (mirrors `build_request` but avoids borrowing `self`).
+                                let padding_len: usize = rand::rng().random_range(100..=1000);
+                                let x_padding = "X".repeat(padding_len);
 
-                        for (k, v) in headers.iter() {
-                            if k.eq_ignore_ascii_case("host")
-                                || k.eq_ignore_ascii_case("referer")
-                            {
-                                continue;
-                            }
-                            request = request.header(k, v);
-                        }
+                                let mut path_and_query = path.clone();
+                                if let Some(q) = base_query.as_ref().filter(|q| !q.is_empty()) {
+                                    path_and_query.push('?');
+                                    path_and_query.push_str(q);
+                                    path_and_query.push('&');
+                                } else {
+                                    path_and_query.push('?');
+                                }
+                                path_and_query.push_str("x_padding=");
+                                path_and_query.push_str(&x_padding);
 
-                        request = request
-                            .header(http::header::HOST, host.as_str())
-                            .header(http::header::REFERER, referer)
-                            .header("Accept-Encoding", "gzip")
-                            .header(http::header::CONTENT_LENGTH, chunk.len());
+                                let referer =
+                                    format!("https://{}{}?x_padding={}", host, path, x_padding);
 
-                        if !has_user_agent {
-                            request = request.header(
-                                http::header::USER_AGENT,
-                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                            );
-                        }
-                        if !has_content_type {
-                            request = request.header(
-                                http::header::CONTENT_TYPE,
-                                "application/grpc",
-                            );
-                        }
+                                let uri = match http::Uri::builder()
+                                    .scheme("https")
+                                    .authority(host.as_str())
+                                    .path_and_query(path_and_query.as_str())
+                                    .build()
+                                {
+                                    Ok(uri) => uri,
+                                    Err(e) => {
+                                        error!("xhttp packet build uri error: {e}");
+                                        flush_at = tokio::time::Instant::now()
+                                            + if closing { Duration::from_millis(0) } else { packet_up_min_interval };
+                                        continue;
+                                    }
+                                };
 
-                        let req = match request.body(()) {
-                            Ok(req) => req,
-                            Err(e) => {
-                                error!("xhttp packet build request error: {e}");
-                                continue;
-                            }
-                        };
+                                let mut request = Request::builder()
+                                    .uri(uri)
+                                    .method(http::Method::POST)
+                                    .version(http::Version::HTTP_2);
 
-                        let (resp, mut send_stream) = match client
-                            .send_request(req, false)
-                        {
-                            Ok(rv) => rv,
-                            Err(e) => {
-                                error!("xhttp packet send_request error: {e}");
-                                continue;
-                            }
-                        };
+                                let has_user_agent = headers
+                                    .keys()
+                                    .any(|k| k.eq_ignore_ascii_case("user-agent"));
+                                let has_content_type = headers
+                                    .keys()
+                                    .any(|k| k.eq_ignore_ascii_case("content-type"));
 
-                        if let Err(e) = send_stream.send_data(chunk, true) {
-                            error!("xhttp packet send_data error: {e}");
-                            continue;
-                        }
+                                for (k, v) in headers.iter() {
+                                    if k.eq_ignore_ascii_case("host")
+                                        || k.eq_ignore_ascii_case("referer")
+                                    {
+                                        continue;
+                                    }
+                                    request = request.header(k, v);
+                                }
 
-                        tokio::spawn(async move {
-                            match resp.await {
-                                Ok(resp) if resp.status() == StatusCode::OK => {}
-                                Ok(resp) => {
-                                    error!(
-                                        "xhttp packet unexpected response status: {}",
-                                        resp.status()
+                                request = request
+                                    .header(http::header::HOST, host.as_str())
+                                    .header(http::header::REFERER, referer)
+                                    .header("Accept-Encoding", "gzip")
+                                    .header(http::header::CONTENT_LENGTH, chunk.len());
+
+                                if !has_user_agent {
+                                    request = request.header(
+                                        http::header::USER_AGENT,
+                                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                                     );
                                 }
-                                Err(e) => {
-                                    error!("xhttp packet response error: {e}");
+                                if !has_content_type {
+                                    request = request.header(
+                                        http::header::CONTENT_TYPE,
+                                        "application/grpc",
+                                    );
                                 }
+
+                                let req = match request.body(()) {
+                                    Ok(req) => req,
+                                    Err(e) => {
+                                        error!("xhttp packet build request error: {e}");
+                                        break 'packet_up;
+                                    }
+                                };
+
+                                client = match client.ready().await {
+                                    Ok(client) => client,
+                                    Err(e) => {
+                                        error!("xhttp packet client ready error: {e}");
+                                        break 'packet_up;
+                                    }
+                                };
+                                let (resp, mut send_stream) = match client.send_request(req, false) {
+                                    Ok(rv) => rv,
+                                    Err(e) => {
+                                        error!("xhttp packet send_request error: {e}");
+                                        break 'packet_up;
+                                    }
+                                };
+
+                                // Respect HTTP/2 flow control; `send_data` can fail when `chunk` is larger
+                                // than the currently-available window. Split into DATA frames as needed.
+                                let mut remaining = chunk;
+                                while !remaining.is_empty() {
+                                    send_stream.reserve_capacity(remaining.len());
+                                    let capacity = match poll_fn(|cx| send_stream.poll_capacity(cx)).await {
+                                        Some(Ok(capacity)) => capacity,
+                                        Some(Err(e)) => {
+                                            error!("xhttp packet poll_capacity error: {e}");
+                                            break 'packet_up;
+                                        }
+                                        None => {
+                                            error!("xhttp packet poll_capacity: broken pipe");
+                                            break 'packet_up;
+                                        }
+                                    };
+                                    if capacity == 0 {
+                                        continue;
+                                    }
+
+                                    let to_write = std::cmp::min(capacity, remaining.len());
+                                    let data = remaining.split_to(to_write);
+                                    let end_stream = remaining.is_empty();
+                                    if let Err(e) = send_stream.send_data(data, end_stream) {
+                                        error!("xhttp packet send_data error: {e}");
+                                        break 'packet_up;
+                                    }
+                                }
+
+                                tokio::spawn(async move {
+                                    match resp.await {
+                                        Ok(resp) if resp.status() == StatusCode::OK => {}
+                                        Ok(resp) => {
+                                            error!(
+                                                "xhttp packet unexpected response status: {}",
+                                                resp.status()
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!("xhttp packet response error: {e}");
+                                        }
+                                    }
+                                });
+
+                                flush_at = tokio::time::Instant::now()
+                                    + if closing { Duration::from_millis(0) } else { packet_up_min_interval };
                             }
-                        });
+                        }
                     }
                 });
 
@@ -449,6 +546,7 @@ pub struct XHttpStream {
     recv: RecvStream,
     send: SendStream<Bytes>,
     buffer: BytesMut,
+    pending_release: usize,
     shutdown_sent: bool,
 }
 
@@ -468,6 +566,7 @@ impl XHttpStream {
             recv,
             send,
             buffer: BytesMut::with_capacity(1024 * 4),
+            pending_release: 0,
             shutdown_sent: false,
         }
     }
@@ -477,7 +576,9 @@ pub struct XHttpPacketStream {
     recv: RecvStream,
     upload: mpsc::Sender<Bytes>,
     buffer: BytesMut,
+    pending_release: usize,
     future_write: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync>>>,
+    shutdown_sent: bool,
 }
 
 impl Debug for XHttpPacketStream {
@@ -495,7 +596,9 @@ impl XHttpPacketStream {
             recv,
             upload,
             buffer: BytesMut::with_capacity(1024 * 4),
+            pending_release: 0,
             future_write: None,
+            shutdown_sent: false,
         }
     }
 }
@@ -510,6 +613,22 @@ impl AsyncRead for XHttpPacketStream {
             let to_read = std::cmp::min(self.buffer.len(), buf.remaining());
             let data = self.buffer.split_to(to_read);
             buf.put_slice(&data[..to_read]);
+            if self.pending_release > 0 {
+                let release = to_read.min(self.pending_release);
+                if release > 0 {
+                    if let Err(e) =
+                        self.recv.flow_control().release_capacity(release)
+                    {
+                        return std::task::Poll::Ready(Err(
+                            std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                e,
+                            ),
+                        ));
+                    }
+                    self.pending_release -= release;
+                }
+            }
             return std::task::Poll::Ready(Ok(()));
         }
         std::task::Poll::Ready(match ready!(self.recv.poll_data(cx)) {
@@ -518,19 +637,24 @@ impl AsyncRead for XHttpPacketStream {
                 buf.put_slice(&data[..to_read]);
                 if to_read < data.len() {
                     self.buffer.extend_from_slice(&data[to_read..]);
+                    self.pending_release += data.len() - to_read;
                 }
-                self.recv
-                    .flow_control()
-                    .release_capacity(to_read)
-                    .map_or_else(
-                        |e| {
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionReset,
-                                e,
-                            ))
-                        },
-                        |_| Ok(()),
-                    )
+                if to_read == 0 {
+                    Ok(())
+                } else {
+                    self.recv
+                        .flow_control()
+                        .release_capacity(to_read)
+                        .map_or_else(
+                            |e| {
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    e,
+                                ))
+                            },
+                            |_| Ok(()),
+                        )
+                }
             }
             Some(Err(e)) => Err(io::Error::new(io::ErrorKind::ConnectionReset, e)),
             None => Ok(()),
@@ -544,6 +668,15 @@ impl AsyncWrite for XHttpPacketStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        if buf.is_empty() {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        if self.shutdown_sent {
+            return std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "xhttp packet stream is shut down",
+            )));
+        }
         if self.future_write.is_none() {
             let upload = self.upload.clone();
             let chunk = Bytes::copy_from_slice(buf);
@@ -575,8 +708,18 @@ impl AsyncWrite for XHttpPacketStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        // Signal EOF to the packet sender.
-        if self.future_write.is_none() {
+        loop {
+            if let Some(future) = self.future_write.as_mut() {
+                std::task::ready!(Pin::new(future).poll(cx))?;
+                self.future_write = None;
+                continue;
+            }
+
+            if self.shutdown_sent {
+                return std::task::Poll::Ready(Ok(()));
+            }
+
+            self.shutdown_sent = true;
             let upload = self.upload.clone();
             self.future_write = Some(Box::pin(async move {
                 upload.send(Bytes::new()).await.map_err(|_| {
@@ -584,13 +727,6 @@ impl AsyncWrite for XHttpPacketStream {
                 })
             }));
         }
-        let future = self
-            .future_write
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "future write not set"))?;
-        std::task::ready!(Pin::new(future).poll(cx))?;
-        self.future_write = None;
-        std::task::Poll::Ready(Ok(()))
     }
 }
 
@@ -604,6 +740,22 @@ impl AsyncRead for XHttpStream {
             let to_read = std::cmp::min(self.buffer.len(), buf.remaining());
             let data = self.buffer.split_to(to_read);
             buf.put_slice(&data[..to_read]);
+            if self.pending_release > 0 {
+                let release = to_read.min(self.pending_release);
+                if release > 0 {
+                    if let Err(e) =
+                        self.recv.flow_control().release_capacity(release)
+                    {
+                        return std::task::Poll::Ready(Err(
+                            std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                e,
+                            ),
+                        ));
+                    }
+                    self.pending_release -= release;
+                }
+            }
             return std::task::Poll::Ready(Ok(()));
         }
         std::task::Poll::Ready(match ready!(self.recv.poll_data(cx)) {
@@ -612,19 +764,24 @@ impl AsyncRead for XHttpStream {
                 buf.put_slice(&data[..to_read]);
                 if to_read < data.len() {
                     self.buffer.extend_from_slice(&data[to_read..]);
+                    self.pending_release += data.len() - to_read;
                 }
-                self.recv
-                    .flow_control()
-                    .release_capacity(to_read)
-                    .map_or_else(
-                        |e| {
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionReset,
-                                e,
-                            ))
-                        },
-                        |_| Ok(()),
-                    )
+                if to_read == 0 {
+                    Ok(())
+                } else {
+                    self.recv
+                        .flow_control()
+                        .release_capacity(to_read)
+                        .map_or_else(
+                            |e| {
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    e,
+                                ))
+                            },
+                            |_| Ok(()),
+                        )
+                }
             }
             Some(Err(e)) => Err(io::Error::new(io::ErrorKind::ConnectionReset, e)),
             None => Ok(()),
@@ -1010,12 +1167,13 @@ mod tests {
         let uuid_str = down_path.rsplit('/').next().expect("uuid segment");
         let uuid = Uuid::parse_str(uuid_str).expect("uuid parse");
 
-        for (seq, expected_body) in [(0u64, b"A".as_slice()), (1, b"BB"), (2, b"CCC")] {
+        let mut uploaded = Vec::new();
+        let mut expected_seq: u64 = 0;
+        while uploaded.len() < 6 {
             let up = recv_req(&mut rx).await;
             assert_eq!(up.method, http::Method::POST);
             assert!(up.path_and_query.contains("foo=bar"));
             assert_padding(&up.path_and_query, &up.headers);
-            assert_eq!(up.body, expected_body);
 
             let content_len = up
                 .headers
@@ -1025,14 +1183,103 @@ mod tests {
                 .unwrap()
                 .parse::<usize>()
                 .unwrap();
-            assert_eq!(content_len, expected_body.len());
+            assert_eq!(content_len, up.body.len());
 
             let up_path = extract_path_only(&up.path_and_query);
             let segments: Vec<_> = up_path.trim_start_matches('/').split('/').collect();
             assert_eq!(segments.len(), 3);
             assert_eq!(segments[0], "xhttp");
             assert_eq!(segments[1], uuid.to_string());
-            assert_eq!(segments[2], seq.to_string());
+            assert_eq!(segments[2], expected_seq.to_string());
+            expected_seq = expected_seq.saturating_add(1);
+
+            uploaded.extend_from_slice(&up.body);
         }
+        assert_eq!(uploaded, b"ABBCCC");
+    }
+
+    #[tokio::test]
+    async fn xhttp_packet_up_sends_large_payload() {
+        fn respond_body(method: &http::Method) -> Option<Bytes> {
+            (method == http::Method::GET).then(|| Bytes::from_static(b"DOWN"))
+        }
+        let (addr, mut rx) = start_h2_server(10, respond_body).await;
+
+        let path: http::uri::PathAndQuery = "/xhttp/?foo=bar".try_into().unwrap();
+        let client = XHttpClient::new(
+            "example.com".to_owned(),
+            HashMap::new(),
+            Some("auto".to_owned()),
+            path,
+        );
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.proxy_stream(Box::new(tcp) as AnyStream),
+        )
+        .await
+        .expect("timeout waiting for xhttp packet-up connect")
+        .unwrap();
+
+        // > 64KiB ensures the implementation respects HTTP/2 flow control and
+        // does not rely on `send_data` accepting the full body in one go.
+        let payload = vec![b'Z'; 150_000];
+        tokio::time::timeout(Duration::from_secs(10), stream.write_all(&payload))
+            .await
+            .expect("timeout writing payload")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), stream.shutdown())
+            .await
+            .expect("timeout shutting down stream")
+            .unwrap();
+
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut out))
+            .await
+            .expect("timeout reading response")
+            .unwrap();
+        assert_eq!(out, b"DOWN");
+
+        let down = recv_req(&mut rx).await;
+        assert_eq!(down.method, http::Method::GET);
+        assert!(down.path_and_query.contains("foo=bar"));
+        assert_padding(&down.path_and_query, &down.headers);
+
+        let down_path = extract_path_only(&down.path_and_query);
+        let uuid_str = down_path.rsplit('/').next().expect("uuid segment");
+        let uuid = Uuid::parse_str(uuid_str).expect("uuid parse");
+
+        let mut uploaded = Vec::new();
+        let mut expected_seq: u64 = 0;
+        while uploaded.len() < payload.len() {
+            let up = recv_req(&mut rx).await;
+            assert_eq!(up.method, http::Method::POST);
+            assert!(up.path_and_query.contains("foo=bar"));
+            assert_padding(&up.path_and_query, &up.headers);
+
+            let content_len = up
+                .headers
+                .get(http::header::CONTENT_LENGTH)
+                .expect("missing content-length")
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            assert_eq!(content_len, up.body.len());
+
+            let up_path = extract_path_only(&up.path_and_query);
+            let segments: Vec<_> = up_path.trim_start_matches('/').split('/').collect();
+            assert_eq!(segments.len(), 3);
+            assert_eq!(segments[0], "xhttp");
+            assert_eq!(segments[1], uuid.to_string());
+            assert_eq!(segments[2], expected_seq.to_string());
+            expected_seq = expected_seq.saturating_add(1);
+
+            uploaded.extend_from_slice(&up.body);
+        }
+
+        assert_eq!(uploaded.len(), payload.len());
+        assert_eq!(uploaded, payload);
     }
 }

@@ -131,14 +131,9 @@ impl AsyncUdpSocket for UdpHop {
 
         let cur = self.get_conn().1;
 
-        // here just need change send addr, it is not necessary to change send
-        // contents, so we can use unsafe
-        unsafe {
-            let prt = transmit as *const Transmit as *mut Transmit;
-            (*prt).destination.set_port(port);
-        }
-
-        cur.try_send(transmit)
+        let mut outbound = transmit.to_owned();
+        outbound.destination.set_port(port);
+        cur.try_send(&outbound)
     }
 
     // fn poll_send(

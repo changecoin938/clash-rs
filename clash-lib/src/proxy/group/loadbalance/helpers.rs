@@ -55,21 +55,32 @@ fn jump_hash(key: u64, buckets: i32) -> i32 {
 }
 
 pub fn strategy_rr() -> StrategyFn {
-    let mut index = 0;
+    let mut index = 0usize;
     Box::new(move |proxies: Vec<AnyOutboundHandler>, _: &Session| {
         let len = proxies.len();
+        if len == 0 {
+            return Box::pin(futures::future::err(std::io::Error::other(
+                "no proxy found",
+            )));
+        }
+        let proxy = proxies[index % len].clone();
         index = (index + 1) % len;
-        Box::pin(futures::future::ok(proxies[index].clone()))
+        Box::pin(futures::future::ok(proxy))
     })
 }
 
 pub fn strategy_consistent_hashring() -> StrategyFn {
     let max_retry = 5;
     Box::new(move |proxies, sess| {
+        if proxies.is_empty() {
+            return Box::pin(futures::future::err(std::io::Error::other(
+                "no proxy found",
+            )));
+        }
         let key = murmur3_32(&mut Cursor::new(get_key(sess)), 0).unwrap() as u64;
         let buckets = proxies.len() as i32;
-        for _ in 0..max_retry {
-            let index = jump_hash(key, buckets);
+        for retry in 0..max_retry {
+            let index = jump_hash(key.wrapping_add(retry as u64), buckets);
             if let Some(proxy) = proxies.get(index as usize) {
                 return Box::pin(futures::future::ok(proxy.clone()));
             }
@@ -112,6 +123,9 @@ pub fn strategy_sticky_session(proxy_manager: ProxyManager) -> StrategyFn {
         };
 
         Box::pin(async move {
+            if proxies.is_empty() {
+                return Err(std::io::Error::other("no proxy found"));
+            }
             let buckets = proxies.len() as i32;
             let (start_index, hit) = match lru_cache_clone.lock().await.get(&key) {
                 Some(&index) => {

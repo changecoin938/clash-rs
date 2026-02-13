@@ -12,7 +12,9 @@ use crate::{
         },
     },
 };
-use crate::proxy::transport::{GrpcClient, H2Client, TcpHttpClient, TlsClient, WsClient};
+use crate::proxy::transport::{
+    GrpcPooledClient, H2Client, TcpHttpClient, TlsClient, WsClient,
+};
 
 impl TryFrom<OutboundShadowsocks> for Handler {
     type Error = crate::Error;
@@ -34,6 +36,8 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
             );
         }
         
+        let mut plugin_includes_tls = false;
+
         let h = Handler::new(HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
@@ -71,13 +75,20 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
                         Some(plugin)
                     }
                     "v2ray-plugin" => {
-                        let opt: V2RayOBFSOption = s
-                            .plugin_opts
-                            .clone()
-                            .ok_or(Error::InvalidConfig(
-                                "plugin_opts is required for plugin obfs".to_owned(),
-                            ))?
-                            .try_into()?;
+                        let mut opt_map = s.plugin_opts.clone().ok_or(
+                            Error::InvalidConfig(
+                                "plugin-opts is required for v2ray-plugin".to_owned(),
+                            ),
+                        )?;
+                        // Most configs omit `port` because it's already the SS server port.
+                        // Default it to the outbound server port for compatibility.
+                        opt_map.entry("port".to_owned()).or_insert_with(|| {
+                            serde_yaml::Value::Number(serde_yaml::Number::from(
+                                s.common_opts.port as u64,
+                            ))
+                        });
+                        let opt: V2RayOBFSOption = opt_map.try_into()?;
+                        plugin_includes_tls = opt.tls;
                         // TODO: support more transport options, replace it with
                         // `V2rayClient`
                         let plugin = V2rayWsClient::try_from(opt)?;
@@ -88,7 +99,7 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
                             .plugin_opts
                             .clone()
                             .ok_or(Error::InvalidConfig(
-                                "plugin_opts is required for plugin obfs".to_owned(),
+                                "plugin-opts is required for shadow-tls".to_owned(),
                             ))?
                             .try_into()?;
                         Some(Box::new(plugin) as _)
@@ -104,6 +115,46 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
             udp: s.udp,
             tls: match s.tls.unwrap_or_default() {
                 true => {
+                    if plugin_includes_tls {
+                        warn!(
+                            "ignoring outer tls for {} because v2ray-plugin already enables tls",
+                            s.common_opts.server
+                        );
+                        None
+                    } else {
+                    let alpn = s.alpn.clone().map(|list| {
+                        list.into_iter()
+                            .map(|v| v.trim().to_owned())
+                            .filter(|v| !v.is_empty())
+                            .collect::<Vec<_>>()
+                    });
+                    let default_alpn = s
+                        .network
+                        .as_ref()
+                        .map(|x| match x.as_str() {
+                            "tcp" => Ok(vec![]),
+                            "tcp_http" => Ok(vec!["http/1.1".to_owned()]),
+                            "ws" => Ok(vec!["http/1.1".to_owned()]),
+                            "http" => Ok(vec![]),
+                            "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
+                            _ => Err(Error::InvalidConfig(format!(
+                                "unsupported network: {x}"
+                            ))),
+                        })
+                        .transpose()?;
+                    let mut alpn = alpn
+                        .filter(|list| !list.is_empty())
+                        .or(default_alpn);
+                    if let Some(required) = match s.network.as_deref() {
+                        Some("h2") | Some("grpc") => Some("h2"),
+                        Some("ws") | Some("tcp_http") => Some("http/1.1"),
+                        _ => None,
+                    } && let Some(list) = alpn.as_mut()
+                    {
+                        if !list.iter().any(|v| v == required) {
+                            list.push(required.to_owned());
+                        }
+                    }
                     let sni = s
                         .server_name
                         .as_ref()
@@ -128,19 +179,7 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
                     let mut client = TlsClient::new(
                         s.skip_cert_verify.unwrap_or_default(),
                         sni,
-                        s.network
-                            .as_ref()
-                            .map(|x| match x.as_str() {
-                                "tcp" => Ok(vec![]),
-                                "tcp_http" => Ok(vec!["http/1.1".to_owned()]),
-                                "ws" => Ok(vec!["http/1.1".to_owned()]),
-                                "http" => Ok(vec![]),
-                                "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
-                                _ => Err(Error::InvalidConfig(format!(
-                                    "unsupported network: {x}"
-                                ))),
-                            })
-                            .transpose()?,
+                        alpn,
                         match s.network.as_deref() {
                             Some("h2") | Some("grpc") => Some("h2".to_owned()),
                             _ => None,
@@ -150,77 +189,90 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
                         client.set_client_fingerprint(s.client_fingerprint.clone());
                     }
                     Some(Box::new(client))
+                    }
                 }
                 false => None,
             },
-            transport: s
-                .network
-                .clone()
-                .filter(|x| x != "tcp" && !x.is_empty())
-                .map(|x| match x.as_str() {
-                    "tcp_http" => s
-                        .tcp_http_opts
-                        .as_ref()
-                        .ok_or(Error::InvalidConfig(
+            transport: {
+                let network = s
+                    .network
+                    .as_deref()
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty() && *x != "tcp");
+                match network {
+                    Some("tcp_http") => Some({
+                        let opt = s.tcp_http_opts.as_ref().ok_or(Error::InvalidConfig(
                             "tcp-http-opts is required for tcp_http".to_owned(),
-                        ))
-                        .and_then(|x| {
-                            let client: TcpHttpClient =
-                                (x, &s.common_opts).try_into().map_err(|e| {
-                                    Error::InvalidConfig(format!(
-                                        "invalid tcp_http options: {e}"
-                                    ))
-                                })?;
-                            Ok(Box::new(client) as _)
-                        }),
-                    "ws" => s
-                        .ws_opts
-                        .as_ref()
-                        .ok_or(Error::InvalidConfig(
+                        ))?;
+                        let client: TcpHttpClient =
+                            (opt, &s.common_opts).try_into().map_err(|e| {
+                                Error::InvalidConfig(format!(
+                                    "invalid tcp_http options: {e}"
+                                ))
+                            })?;
+                        Box::new(client) as _
+                    }),
+                    Some("ws") => Some({
+                        let opt = s.ws_opts.as_ref().ok_or(Error::InvalidConfig(
                             "ws_opts is required for ws".to_owned(),
-                        ))
-                        .and_then(|x| {
-                            let client: WsClient =
-                                (x, &s.common_opts).try_into().map_err(|e| {
-                                    Error::InvalidConfig(format!("invalid ws options: {e}"))
-                                })?;
-                            Ok(Box::new(client) as _)
-                        }),
-                    "h2" => s
-                        .h2_opts
-                        .as_ref()
-                        .ok_or(Error::InvalidConfig(
+                        ))?;
+                        let client: WsClient = (opt, &s.common_opts)
+                            .try_into()
+                            .map_err(|e| {
+                                Error::InvalidConfig(format!(
+                                    "invalid ws options: {e}"
+                                ))
+                            })?;
+                        Box::new(client) as _
+                    }),
+                    Some("h2") => Some({
+                        let opt = s.h2_opts.as_ref().ok_or(Error::InvalidConfig(
                             "h2_opts is required for h2".to_owned(),
-                        ))
-                        .and_then(|x| {
-                            let client: H2Client =
-                                (x, &s.common_opts).try_into().map_err(|e| {
-                                    Error::InvalidConfig(format!("invalid h2 options: {e}"))
-                                })?;
-                            Ok(Box::new(client) as _)
-                        }),
-                    "grpc" => s
-                        .grpc_opts
-                        .as_ref()
-                        .ok_or(Error::InvalidConfig(
+                        ))?;
+                        let client: H2Client =
+                            (opt, &s.common_opts).try_into().map_err(|e| {
+                                Error::InvalidConfig(format!(
+                                    "invalid h2 options: {e}"
+                                ))
+                            })?;
+                        Box::new(client) as _
+                    }),
+                    Some("grpc") => None,
+                    Some(other) => {
+                        return Err(Error::InvalidConfig(format!(
+                            "unsupported network: {other}"
+                        )));
+                    }
+                    None => None,
+                }
+            },
+            grpc: {
+                let network = s
+                    .network
+                    .as_deref()
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty() && *x != "tcp");
+                match network {
+                    Some("grpc") => {
+                        let opt = s.grpc_opts.as_ref().ok_or(Error::InvalidConfig(
                             "grpc_opts is required for grpc".to_owned(),
+                        ))?;
+                        let host = s
+                            .server_name
+                            .as_ref()
+                            .filter(|x| !x.is_empty())
+                            .cloned()
+                            .unwrap_or(s.common_opts.server.to_owned());
+                        Some(GrpcPooledClient::new(
+                            host,
+                            opt.grpc_service_name.clone().unwrap_or_default(),
+                            opt.mode.clone(),
+                            s.tls.unwrap_or_default(),
                         ))
-                        .and_then(|x| {
-                            let client: GrpcClient =
-                                (s.server_name.clone(), x, &s.common_opts)
-                                    .try_into()
-                                    .map_err(|e| {
-                                        Error::InvalidConfig(format!(
-                                            "invalid grpc options: {e}"
-                                        ))
-                                    })?;
-                            Ok(Box::new(client) as _)
-                        }),
-                    _ => Err(Error::InvalidConfig(format!(
-                        "unsupported network: {x}"
-                    ))),
-                })
-                .transpose()?,
+                    }
+                    _ => None,
+                }
+            },
         });
         Ok(h)
     }
@@ -323,8 +375,11 @@ impl TryFrom<HashMap<String, serde_yaml::Value>> for Shadowtls {
             .unwrap_or("bing.com");
         let password = value
             .get("password")
-            .and_then(|x| x.as_str().to_owned())
-            .ok_or(Error::InvalidConfig("obfs mode is required".to_owned()))?;
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_owned())
+            .ok_or(Error::InvalidConfig(
+                "password is required for shadow-tls".to_owned(),
+            ))?;
         let strict = value
             .get("strict")
             .and_then(|x| x.as_bool())

@@ -19,12 +19,12 @@ impl std::str::FromStr for KeyBytes {
             }
             43 | 44 => {
                 // Try to parse as base64
-                if let Ok(decoded_key) = STANDARD.decode(s) {
-                    if decoded_key.len() == internal.len() {
-                        internal[..].copy_from_slice(&decoded_key);
-                    } else {
-                        return Err("Illegal character in key");
-                    }
+                let decoded_key =
+                    STANDARD.decode(s).map_err(|_| "Illegal character in key")?;
+                if decoded_key.len() == internal.len() {
+                    internal[..].copy_from_slice(&decoded_key);
+                } else {
+                    return Err("Illegal character in key");
                 }
             }
             _ => return Err("Illegal key size"),

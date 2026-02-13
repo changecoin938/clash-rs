@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use rand::{Rng, distr::Distribution};
 use std::{
     io,
-    ptr::copy_nonoverlapping,
     sync::{Arc, LazyLock},
 };
 use stream::{ProxyTlsStream, VerifiedStream};
@@ -146,13 +145,7 @@ fn generate_session_id(hmac: &Hmac, buf: &[u8]) -> [u8; TLS_SESSION_ID_SIZE] {
     hmac.update(&session_id);
     hmac.update(&buf[SESSION_ID_START + TLS_SESSION_ID_SIZE..]);
     let hmac_val = hmac.finalize();
-    unsafe {
-        copy_nonoverlapping(
-            hmac_val.as_ptr(),
-            session_id.as_mut_ptr().add(TLS_SESSION_ID_SIZE - HMAC_SIZE),
-            HMAC_SIZE,
-        )
-    }
+    session_id[TLS_SESSION_ID_SIZE - HMAC_SIZE..].copy_from_slice(&hmac_val);
     session_id
 }
 

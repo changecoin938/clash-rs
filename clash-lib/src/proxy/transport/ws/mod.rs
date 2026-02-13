@@ -35,6 +35,13 @@ impl Client {
         max_early_data: usize,
         early_data_header_name: String,
     ) -> Self {
+        let path = if path.is_empty() {
+            "/".to_owned()
+        } else if path.starts_with('/') {
+            path
+        } else {
+            format!("/{path}")
+        };
         Self {
             server,
             port,

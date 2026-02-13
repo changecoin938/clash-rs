@@ -152,18 +152,17 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
             };
 
             let n = ready!(inner.poll_send_to(cx, data.as_slice(), dst))?;
-            let wrote_all = n == data.len();
-            self.pkt = None;
-            self.flushed = true;
-
-            let res = if wrote_all {
-                Ok(())
+            if n == data.len() {
+                self.pkt = None;
+                self.flushed = true;
+                Poll::Ready(Ok(()))
             } else {
-                Err(new_io_error(format!(
+                // Keep the packet so callers may retry/handle the error.
+                self.flushed = false;
+                Poll::Ready(Err(new_io_error(format!(
                     "failed to send all data, only sent {n} bytes"
-                )))
-            };
-            Poll::Ready(res)
+                ))))
+            }
         } else {
             Poll::Ready(Err(io::Error::other("no packet to send")))
         }

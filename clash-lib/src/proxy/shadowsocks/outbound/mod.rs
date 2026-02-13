@@ -32,7 +32,7 @@ use shadowsocks::{
 };
 use std::{fmt::Debug, io, sync::Arc};
 use tracing::debug;
-use crate::proxy::transport::Transport;
+use crate::proxy::transport::{GrpcPooledClient, Transport};
 
 pub struct HandlerOptions {
     pub name: String,
@@ -44,6 +44,7 @@ pub struct HandlerOptions {
     pub plugin: Option<Box<dyn Sip003Plugin>>,
     pub udp: bool,
     pub transport: Option<Box<dyn Transport>>,
+    pub grpc: Option<GrpcPooledClient>,
     pub tls: Option<Box<dyn Transport>>,
 }
 
@@ -71,6 +72,24 @@ impl Handler {
         }
     }
 
+    async fn proxy_stream_after_transport(
+        &self,
+        stream: AnyStream,
+        sess: &Session,
+    ) -> std::io::Result<AnyStream> {
+        let ctx = Context::new_shared(ServerType::Local);
+        let cfg = self.server_config()?;
+
+        let stream = ProxyClientStream::from_stream(
+            ctx,
+            stream,
+            &cfg,
+            (sess.destination.host(), sess.destination.port()),
+        );
+
+        Ok(Box::new(ShadowSocksStream(stream)))
+    }
+
     async fn proxy_stream(
         &self,
         s: AnyStream,
@@ -93,18 +112,7 @@ impl Handler {
         } else {
             stream
         };
-
-        let ctx = Context::new_shared(ServerType::Local);
-        let cfg = self.server_config()?;
-
-        let stream = ProxyClientStream::from_stream(
-            ctx,
-            stream,
-            &cfg,
-            (sess.destination.host(), sess.destination.port()),
-        );
-
-        Ok(Box::new(ShadowSocksStream(stream)))
+        self.proxy_stream_after_transport(stream, sess).await
     }
 
     fn server_config(&self) -> Result<ServerConfig, io::Error> {
@@ -185,18 +193,58 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedStream> {
-        let stream = connector
-            .connect_stream(
-                resolver.clone(),
-                self.opts.server.as_str(),
-                self.opts.port,
-                sess.iface.as_ref(),
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
-            )
-            .await?;
+        let iface = sess.iface.clone();
+        #[cfg(target_os = "linux")]
+        let so_mark = sess.so_mark;
 
-        let s = self.proxy_stream(stream, sess, resolver).await?;
+        let s = if let Some(grpc) = self.opts.grpc.as_ref() {
+            let tls = self.opts.tls.as_ref();
+            let plugin = self.opts.plugin.as_ref();
+            let grpc_stream = grpc
+                .open_stream(|| {
+                    let resolver = resolver.clone();
+                    let iface = iface.clone();
+                    async move {
+                        let stream = connector
+                            .connect_stream(
+                                resolver,
+                                self.opts.server.as_str(),
+                                self.opts.port,
+                                iface.as_ref(),
+                                #[cfg(target_os = "linux")]
+                                so_mark,
+                            )
+                            .await?;
+
+                        let stream: AnyStream = match plugin {
+                            Some(plugin) => plugin.proxy_stream(stream).await?,
+                            None => stream,
+                        };
+
+                        let stream = if let Some(tls) = tls {
+                            tls.proxy_stream(stream).await?
+                        } else {
+                            stream
+                        };
+
+                        Ok(stream)
+                    }
+                })
+                .await?;
+            self.proxy_stream_after_transport(grpc_stream, sess).await?
+        } else {
+            let stream = connector
+                .connect_stream(
+                    resolver.clone(),
+                    self.opts.server.as_str(),
+                    self.opts.port,
+                    iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    so_mark,
+                )
+                .await?;
+            self.proxy_stream(stream, sess, resolver).await?
+        };
         let chained = ChainedStreamWrapper::new(s);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
@@ -337,6 +385,9 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Default::default(),
             udp: false,
+            transport: None,
+            grpc: None,
+            tls: None,
         };
         let port = opts.port;
         let handler = Arc::new(Handler::new(opts));
@@ -394,6 +445,9 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Some(Box::new(client)),
             udp: false,
+            transport: None,
+            grpc: None,
+            tls: None,
         };
         let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));
         // we need to store all the runners in a container, to make sure all of
@@ -454,6 +508,9 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Some(plugin),
             udp: false,
+            transport: None,
+            grpc: None,
+            tls: None,
         };
 
         let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));
@@ -502,6 +559,9 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Some(Box::new(plugin)),
             udp: false,
+            transport: None,
+            grpc: None,
+            tls: None,
         };
 
         let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));

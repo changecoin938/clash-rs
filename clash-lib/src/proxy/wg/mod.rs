@@ -131,21 +131,43 @@ impl Handler {
                             .opts
                             .private_key
                             .parse::<KeyBytes>()
-                            .unwrap()
+                            .map_err(|e| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("invalid wireguard private_key: {e}"),
+                                )
+                            })?
                             .0
                             .into(),
                         endpoint_public_key: self
                             .opts
                             .public_key
                             .parse::<KeyBytes>()
-                            .unwrap()
+                            .map_err(|e| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("invalid wireguard public_key: {e}"),
+                                )
+                            })?
                             .0
                             .into(),
                         preshared_key: self
                             .opts
                             .preshared_key
                             .as_ref()
-                            .map(|s| s.parse::<KeyBytes>().unwrap().0.into()),
+                            .map(|s| {
+                                s.parse::<KeyBytes>()
+                                    .map(|k| k.0.into())
+                                    .map_err(|e| {
+                                        io::Error::new(
+                                            io::ErrorKind::InvalidInput,
+                                            format!(
+                                                "invalid wireguard preshared_key: {e}"
+                                            ),
+                                        )
+                                    })
+                            })
+                            .transpose()?,
                         remote_endpoint: (server_ip, self.opts.port).into(),
                         source_peer_ip: self.opts.ip,
                         source_peer_ipv6: self.opts.ipv6,
@@ -190,18 +212,26 @@ impl Handler {
                     self.opts.ipv6,
                     resolver,
                     if self.opts.remote_dns_resolve {
-                        self.opts
-                            .dns
-                            .as_ref()
-                            .map(|server| {
-                                server
-                                    .iter()
-                                    .map(|s| {
-                                        (s.parse::<IpAddr>().unwrap(), 53).into()
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default()
+                        if let Some(servers) = self.opts.dns.as_ref() {
+                            servers
+                                .iter()
+                                .map(|s| {
+                                    s.parse::<IpAddr>()
+                                        .map(|ip| (ip, 53).into())
+                                        .map_err(|e| {
+                                            io::Error::new(
+                                                io::ErrorKind::InvalidInput,
+                                                format!(
+                                                    "invalid wireguard dns server `{s}`: \
+                                                     {e}"
+                                                ),
+                                            )
+                                        })
+                                })
+                                .collect::<io::Result<Vec<_>>>()?
+                        } else {
+                            vec![]
+                        }
                     } else {
                         vec![]
                     },
@@ -256,15 +286,24 @@ impl OutboundHandler for Handler {
                 .opts
                 .dns
                 .as_ref()
-                .unwrap()
+                .ok_or_else(|| new_io_error("wireguard dns servers are not configured"))?
                 .choose(&mut rand::rng())
-                .unwrap();
+                .ok_or_else(|| {
+                    new_io_error("wireguard dns server list is empty")
+                })?;
+
+            let dns_server = server.parse::<IpAddr>().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid wireguard dns server `{server}`: {e}"),
+                )
+            })?;
 
             inner
                 .device_manager
                 .look_up_dns(
                     &sess.destination.host(),
-                    (server.parse::<IpAddr>().unwrap(), 53).into(),
+                    (dns_server, 53).into(),
                 )
                 .await
                 .ok_or(new_io_error("invalid remote address"))?

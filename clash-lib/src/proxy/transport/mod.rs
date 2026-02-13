@@ -11,6 +11,7 @@ mod ws;
 mod tcp_http;
 
 pub use grpc::Client as GrpcClient;
+pub use grpc::PooledClient as GrpcPooledClient;
 pub use h2::Client as H2Client;
 pub use shadow_tls::Client as Shadowtls;
 pub use simple_obfs::*;

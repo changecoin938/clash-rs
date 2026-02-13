@@ -7,7 +7,7 @@ use crate::{
     config::internal::proxy::OutboundTrojan,
     proxy::{
         HandlerCommonOptions,
-        transport::{GrpcClient, TlsClient, WsClient},
+        transport::{GrpcPooledClient, TlsClient, WsClient},
         trojan::{Handler, HandlerOptions},
     },
 };
@@ -53,17 +53,35 @@ impl TryFrom<&OutboundTrojan> for Handler {
             password: s.password.clone(),
             udp: s.udp.unwrap_or_default(),
             tls: {
-                let alpn = s.alpn.clone().or_else(|| match s.network.as_deref() {
-                    Some("ws") | Some("tcp_http") => Some(vec!["http/1.1".to_owned()]),
-                    Some("grpc") => Some(vec!["h2".to_owned()]),
-                    _ => Some(
-                        DEFAULT_ALPN
+                let alpn = s.alpn.clone().map(|list| {
+                    list.into_iter()
+                        .map(|v| v.trim().to_owned())
+                        .filter(|v| !v.is_empty())
+                        .collect::<Vec<_>>()
+                });
+                let mut alpn = alpn.filter(|list| !list.is_empty()).or_else(|| {
+                    Some(match s.network.as_deref() {
+                        Some("ws") | Some("tcp_http") => {
+                            vec!["http/1.1".to_owned()]
+                        }
+                        Some("grpc") => vec!["h2".to_owned()],
+                        _ => DEFAULT_ALPN
                             .iter()
                             .copied()
                             .map(|x| x.to_owned())
                             .collect::<Vec<String>>(),
-                    ),
+                    })
                 });
+                if let Some(required) = match s.network.as_deref() {
+                    Some("grpc") => Some("h2"),
+                    Some("ws") | Some("tcp_http") => Some("http/1.1"),
+                    _ => None,
+                } && let Some(list) = alpn.as_mut()
+                {
+                    if !list.iter().any(|v| v == required) {
+                        list.push(required.to_owned());
+                    }
+                }
                 let mut client = TlsClient::new(
                     effective_skip_cert_verify,
                     s.sni
@@ -124,61 +142,74 @@ impl TryFrom<&OutboundTrojan> for Handler {
                 }
                 Some(Box::new(client))
             },
-            transport: s
-                .network
-                .as_ref()
-                .filter(|x| x.as_str() != "tcp" && !x.is_empty())
-                .map(|x| match x.as_str() {
-                    "tcp_http" => s
-                        .tcp_http_opts
-                        .as_ref()
-                        .ok_or(Error::InvalidConfig(
+            transport: {
+                let network = s
+                    .network
+                    .as_deref()
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty() && *x != "tcp");
+                match network {
+                    Some("tcp_http") => Some({
+                        let opt = s.tcp_http_opts.as_ref().ok_or(Error::InvalidConfig(
                             "tcp-http-opts is required for tcp_http".to_owned(),
-                        ))
-                        .and_then(|x| {
-                            let client: TcpHttpClient =
-                                (x, &s.common_opts).try_into().map_err(|e| {
-                                    Error::InvalidConfig(format!(
-                                        "invalid tcp_http options: {e}"
-                                    ))
-                                })?;
-                            Ok(Box::new(client) as _)
-                        }),
-                    "ws" => s
-                        .ws_opts
-                        .as_ref()
-                        .ok_or(Error::InvalidConfig(
+                        ))?;
+                        let client: TcpHttpClient =
+                            (opt, &s.common_opts).try_into().map_err(|e| {
+                                Error::InvalidConfig(format!(
+                                    "invalid tcp_http options: {e}"
+                                ))
+                            })?;
+                        Box::new(client) as _
+                    }),
+                    Some("ws") => Some({
+                        let opt = s.ws_opts.as_ref().ok_or(Error::InvalidConfig(
                             "ws_opts is required for ws".to_owned(),
-                        ))
-                        .and_then(|x| {
-                            let client: WsClient =
-                                (x, &s.common_opts).try_into().map_err(|e| {
-                                    Error::InvalidConfig(format!("invalid ws options: {e}"))
-                                })?;
-                            Ok(Box::new(client) as _)
-                        }),
-                    "grpc" => s
-                        .grpc_opts
-                        .as_ref()
-                        .ok_or(Error::InvalidConfig(
+                        ))?;
+                        let client: WsClient = (opt, &s.common_opts)
+                            .try_into()
+                            .map_err(|e| {
+                                Error::InvalidConfig(format!(
+                                    "invalid ws options: {e}"
+                                ))
+                            })?;
+                        Box::new(client) as _
+                    }),
+                    Some("grpc") => None,
+                    Some(other) => {
+                        return Err(Error::InvalidConfig(format!(
+                            "unsupported trojan network: {other}"
+                        )));
+                    }
+                    None => None,
+                }
+            },
+            grpc: {
+                let network = s
+                    .network
+                    .as_deref()
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty() && *x != "tcp");
+                match network {
+                    Some("grpc") => {
+                        let opt = s.grpc_opts.as_ref().ok_or(Error::InvalidConfig(
                             "grpc_opts is required for grpc".to_owned(),
+                        ))?;
+                        let host = s
+                            .sni
+                            .as_ref()
+                            .filter(|x| !x.is_empty())
+                            .cloned()
+                            .unwrap_or(s.common_opts.server.to_owned());
+                        Some(GrpcPooledClient::new(
+                            host,
+                            opt.grpc_service_name.clone().unwrap_or_default(),
+                            opt.mode.clone(),
+                            true,
                         ))
-                        .and_then(|x| {
-                            let client: GrpcClient =
-                                (s.sni.clone(), x, &s.common_opts)
-                                    .try_into()
-                                    .map_err(|e| {
-                                        Error::InvalidConfig(format!(
-                                            "invalid grpc options: {e}"
-                                        ))
-                                    })?;
-                            Ok(Box::new(client) as _)
-                        }),
-                    _ => Err(Error::InvalidConfig(format!(
-                        "unsupported trojan network: {x}"
-                    ))),
-                })
-                .transpose()?,
+                    }
+                    _ => None,
+                }
+            },
         });
         Ok(h)
     }

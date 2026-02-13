@@ -226,7 +226,6 @@ impl Stream for UdpSession {
         let socket = &this.socket;
         this.read_buf.resize(this.read_buf.capacity(), 0);
         let mut buf = ReadBuf::new(&mut this.read_buf);
-        dbg!(buf.initialized().len());
         buf.clear();
         match socket.poll_recv_from(cx, &mut buf) {
             Poll::Ready(Ok(src_addr)) => {

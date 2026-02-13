@@ -507,7 +507,8 @@ impl HysteriaConnection {
                 ));
             }
         };
-        let fragments = Fragments::new(session_id, pkt_id, addr, max_frag_size, pkt);
+        let fragments =
+            Fragments::new(session_id, pkt_id, addr, max_frag_size, pkt)?;
         for frag in fragments {
             self.conn
                 .send_datagram(frag)
@@ -518,7 +519,13 @@ impl HysteriaConnection {
 
     pub async fn recv_packet(self: Arc<Self>, pkt: Bytes) {
         let mut buf: BytesMut = pkt.into();
-        let pkt = codec::HysUdpPacket::decode(&mut buf).unwrap();
+        let pkt = match codec::HysUdpPacket::decode(&mut buf) {
+            Ok(pkt) => pkt,
+            Err(err) => {
+                warn!("hysteria2 invalid udp packet dropped: {err}");
+                return;
+            }
+        };
         let session_id = pkt.session_id;
         let mut udp_sessions = self.udp_sessions.lock().await;
         match udp_sessions.get_mut(&session_id) {

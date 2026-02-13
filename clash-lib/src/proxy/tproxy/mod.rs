@@ -327,7 +327,9 @@ async fn handle_packet_from_dispatcher(
             _ = &mut sleep => {
                 sleep = Box::pin(tokio::time::sleep(Duration::from_secs(60)));
                 let now = Instant::now();
-                responder_map.retain(|_k, v| now.duration_since(v.1).as_secs() < 60);
+                responder_map.retain(|_k, v| {
+                    now.saturating_duration_since(v.1).as_secs() < 60
+                });
             },
             else => {
                 tracing::error!("dispatcher channel to tproxy is closed");

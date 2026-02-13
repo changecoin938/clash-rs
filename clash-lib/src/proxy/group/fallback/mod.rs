@@ -58,15 +58,21 @@ impl Handler {
         get_proxies_from_providers(&self.providers, touch).await
     }
 
-    async fn find_alive_proxy(&self, touch: bool) -> AnyOutboundHandler {
+    async fn find_alive_proxy(&self, touch: bool) -> io::Result<AnyOutboundHandler> {
         let proxies = self.get_proxies(touch).await;
+        if proxies.is_empty() {
+            return Err(io::Error::other(format!(
+                "no proxy found for {}",
+                self.name()
+            )));
+        }
         for proxy in proxies.iter() {
             if self.proxy_manager.alive(proxy.name()).await {
                 debug!("`{}` fallback to `{}`", self.name(), proxy.name());
-                return proxy.clone();
+                return Ok(proxy.clone());
             }
         }
-        proxies[0].clone()
+        Ok(proxies[0].clone())
     }
 }
 
@@ -87,7 +93,13 @@ impl OutboundHandler for Handler {
 
     /// whether the outbound handler support UDP
     async fn support_udp(&self) -> bool {
-        self.opts.udp || self.find_alive_proxy(false).await.support_udp().await
+        if self.opts.udp {
+            return true;
+        }
+        match self.find_alive_proxy(false).await {
+            Ok(proxy) => proxy.support_udp().await,
+            Err(_) => false,
+        }
     }
 
     /// connect to remote target via TCP
@@ -96,7 +108,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream> {
-        let proxy = self.find_alive_proxy(true).await;
+        let proxy = self.find_alive_proxy(true).await?;
         let s = proxy.connect_stream(sess, resolver).await?;
 
         s.append_to_chain(self.name()).await;
@@ -110,7 +122,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedDatagram> {
-        let proxy = self.find_alive_proxy(true).await;
+        let proxy = self.find_alive_proxy(true).await?;
         let s = proxy.connect_datagram(sess, resolver).await?;
 
         s.append_to_chain(self.name()).await;
@@ -128,10 +140,12 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedStream> {
-        let proxy = self.find_alive_proxy(true).await;
-        proxy
+        let proxy = self.find_alive_proxy(true).await?;
+        let s = proxy
             .connect_stream_with_connector(sess, resolver, connector)
-            .await
+            .await?;
+        s.append_to_chain(self.name()).await;
+        Ok(s)
     }
 
     fn try_as_group_handler(&self) -> Option<&dyn GroupProxyAPIResponse> {
@@ -146,7 +160,7 @@ impl GroupProxyAPIResponse for Handler {
     }
 
     async fn get_active_proxy(&self) -> Option<AnyOutboundHandler> {
-        Some(Handler::find_alive_proxy(self, false).await)
+        Handler::find_alive_proxy(self, false).await.ok()
     }
 
     fn get_latency_test_url(&self) -> Option<String> {
