@@ -900,8 +900,13 @@ fn blake3_hash_root_with_flags(input: &[u8], key: &CvWords, flags: u8) -> [u8; 3
     while cvs.len() > 2 {
         let mut next = VecDeque::new();
         while cvs.len() >= 2 {
-            let left = cvs.pop_front().unwrap();
-            let right = cvs.pop_front().unwrap();
+            let Some(left) = cvs.pop_front() else {
+                break;
+            };
+            let Some(right) = cvs.pop_front() else {
+                next.push_back(left);
+                break;
+            };
             let out = parent_output(&left, &right, key, flags, platform);
             next.push_back(out.chaining_value());
         }
@@ -911,8 +916,12 @@ fn blake3_hash_root_with_flags(input: &[u8], key: &CvWords, flags: u8) -> [u8; 3
         cvs = next;
     }
 
-    let left = cvs.pop_front().unwrap();
-    let right = cvs.pop_front().unwrap();
+    let Some(left) = cvs.pop_front() else {
+        return [0u8; 32];
+    };
+    let Some(right) = cvs.pop_front() else {
+        return [0u8; 32];
+    };
     parent_output(&left, &right, key, flags, platform).root_hash()
 }
 

@@ -90,7 +90,7 @@ impl AsyncWrite for WebsocketConn {
                 .map_err(map_io_error)?;
             self.need_flush = true;
         }
-        ready!(self.poll_flush(cx)?);
+        ready!(self.poll_flush(cx))?;
         std::task::Poll::Ready(Ok(buf.len()))
     }
 

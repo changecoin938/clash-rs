@@ -260,6 +260,16 @@ impl TryFrom<&OutboundVmess> for Handler {
                         client.set_client_fingerprint(s.client_fingerprint.clone());
                     }
                     if let Some(reality_opts) = s.reality_opts.as_ref() {
+                        if let Some(spider_x) = reality_opts
+                            .spider_x
+                            .as_deref()
+                            .filter(|x| !x.is_empty())
+                        {
+                            warn!(
+                                "reality-opts.spider-x is currently ignored for {}: {}",
+                                s.common_opts.server, spider_x
+                            );
+                        }
                         let public_key = reality_opts
                             .public_key
                             .as_ref()

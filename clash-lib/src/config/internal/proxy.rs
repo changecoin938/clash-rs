@@ -396,6 +396,10 @@ pub struct OutboundTuic {
     pub reduce_rtt: Option<bool>,
     /// millis
     pub request_timeout: Option<u64>,
+    /// millis
+    ///
+    /// If omitted, defaults to `request-timeout` (legacy behavior).
+    pub idle_timeout: Option<u64>,
     pub udp_relay_mode: Option<String>,
     pub congestion_controller: Option<String>,
     /// bytes

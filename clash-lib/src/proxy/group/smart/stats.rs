@@ -22,10 +22,10 @@ use serde::{Deserialize, Serialize};
 pub struct SiteStats {
     /// History of connection delays (milliseconds) - Public for bincode
     /// serialization
-    pub delay_history: Vec<f64>,
+    pub delay_history: VecDeque<f64>,
     /// Track connection success/failure history - Public for bincode
     /// serialization
-    pub success_history: Vec<bool>,
+    pub success_history: VecDeque<bool>,
     /// Last time this site was accessed (Unix timestamp seconds)
     last_attempt_secs: u64,
 }
@@ -36,8 +36,8 @@ impl SiteStats {
     /// Create a new SiteStats instance
     pub fn new() -> Self {
         Self {
-            delay_history: Vec::with_capacity(MAX_HISTORY_SIZE),
-            success_history: Vec::with_capacity(MAX_HISTORY_SIZE),
+            delay_history: VecDeque::with_capacity(MAX_HISTORY_SIZE),
+            success_history: VecDeque::with_capacity(MAX_HISTORY_SIZE),
             last_attempt_secs: current_timestamp_secs(),
         }
     }
@@ -59,16 +59,16 @@ impl SiteStats {
         // Update delay history (only for successful connections)
         if success {
             if self.delay_history.len() >= MAX_HISTORY_SIZE {
-                self.delay_history.remove(0);
+                self.delay_history.pop_front();
             }
-            self.delay_history.push(delay);
+            self.delay_history.push_back(delay);
         }
 
         // Update success history
         if self.success_history.len() >= MAX_HISTORY_SIZE {
-            self.success_history.remove(0);
+            self.success_history.pop_front();
         }
-        self.success_history.push(success);
+        self.success_history.push_back(success);
 
         self.last_attempt_secs = current_timestamp_secs();
     }
@@ -89,14 +89,13 @@ impl SiteStats {
 
         let mut sum = 0.0;
         let mut weight_sum = 0.0;
-        let now_secs = current_timestamp_secs();
+        let len = self.delay_history.len();
 
-        // Calculate age based on last_attempt_secs and current time
-        let age_secs = now_secs.saturating_sub(self.last_attempt_secs) as f64; // u64 -> f64
-
-        for delay in self.delay_history.iter() {
-            // Use the calculated age for time weighting
-            let time_weight = (-0.1 * age_secs as f64).exp(); // Specify f64
+        // Weight newer samples more heavily (we only store a bounded history, so
+        // relative recency is enough here).
+        for (idx, delay) in self.delay_history.iter().enumerate() {
+            let age = (len - 1 - idx) as f64; // 0 = newest
+            let time_weight = (-0.5 * age).exp();
             let delay_weight = (-0.001 * *delay).exp(); // Dereference delay, remove redundant cast. Higher delays get less weight
             let weight = time_weight * delay_weight;
 

@@ -96,7 +96,11 @@ pub async fn authenticate(
             .any(|p| p.prompt.contains(VERIFICATION_CODE_PROMPT))
         {
             totp.clone()
-                .map(|t| t.generate_current().unwrap())
+                .and_then(|t| {
+                    t.generate_current().inspect_err(|e| {
+                        tracing::warn!("failed to generate TOTP code: {:?}", e);
+                    }).ok()
+                })
                 .map(|t| vec![t])
                 .unwrap_or_default()
         } else {

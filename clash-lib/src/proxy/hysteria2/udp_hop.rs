@@ -66,7 +66,10 @@ impl UdpHop {
     }
 
     fn hop(&self) -> u16 {
-        let mut lock = self.state.lock().unwrap();
+        let mut lock = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("hysteria2 udp_hop state lock poisoned");
+            e.into_inner()
+        });
         let HopState {
             prev_conn,
             cur_conn,
@@ -97,7 +100,10 @@ impl UdpHop {
     fn get_conn(
         &self,
     ) -> (Option<Arc<dyn AsyncUdpSocket>>, Arc<dyn AsyncUdpSocket>) {
-        let lock = self.state.lock().unwrap();
+        let lock = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("hysteria2 udp_hop state lock poisoned");
+            e.into_inner()
+        });
         let HopState {
             prev_conn,
             cur_conn,
@@ -107,7 +113,10 @@ impl UdpHop {
     }
 
     fn drop_prcv_conn(&self) {
-        let mut lock = self.state.lock().unwrap();
+        let mut lock = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("hysteria2 udp_hop state lock poisoned");
+            e.into_inner()
+        });
         lock.deref_mut().prev_conn.take();
     }
 }

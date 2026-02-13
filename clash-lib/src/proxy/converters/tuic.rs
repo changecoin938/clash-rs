@@ -49,10 +49,11 @@ impl TryFrom<&OutboundTuic> for Handler {
             ),
             reduce_rtt: s.reduce_rtt.unwrap_or(false)
                 || s.fast_open.unwrap_or(false),
-            request_timeout: Duration::from_millis(
-                s.request_timeout.unwrap_or(4000),
+            request_timeout: Duration::from_millis(s.request_timeout.unwrap_or(4000)),
+            idle_timeout: Duration::from_millis(
+                s.idle_timeout
+                    .unwrap_or_else(|| s.request_timeout.unwrap_or(4000)),
             ),
-            idle_timeout: Duration::from_millis(s.request_timeout.unwrap_or(4000)),
             congestion_controller: s
                 .congestion_controller
                 .clone()

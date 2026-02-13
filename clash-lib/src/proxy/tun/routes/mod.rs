@@ -31,6 +31,7 @@ use tracing::warn;
 use crate::config::internal::config::TunConfig;
 
 use crate::app::net::get_interface_by_name;
+use std::io;
 
 #[allow(dead_code)]
 pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> {
@@ -38,8 +39,12 @@ pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> 
         #[cfg(target_os = "linux")]
         linux::check_ip_command_installed()?;
 
-        let tun_iface =
-            get_interface_by_name(tun_name).expect("tun interface not found");
+        let tun_iface = get_interface_by_name(tun_name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("tun interface not found: {tun_name}"),
+            )
+        })?;
 
         if cfg.route_all {
             warn!(

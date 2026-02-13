@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde::Serialize;
-use std::{io, sync::Arc};
+use std::{io, sync::{Arc, OnceLock}};
 use tracing::warn;
 
 use super::Transport;
@@ -11,6 +11,8 @@ use crate::{
     },
     proxy::AnyStream,
 };
+
+static SSLKEYLOGFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Serialize, Clone)]
 pub struct TLSOptions {
@@ -130,7 +132,9 @@ impl Transport for Client {
             }
         }
 
-        if std::env::var("SSLKEYLOGFILE").is_ok() {
+        if *SSLKEYLOGFILE_ENABLED
+            .get_or_init(|| std::env::var("SSLKEYLOGFILE").is_ok())
+        {
             tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
         }
 

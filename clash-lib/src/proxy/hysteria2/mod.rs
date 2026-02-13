@@ -249,7 +249,11 @@ impl Handler {
             .connect(server_socket_addr, self.opts.sni.as_deref().unwrap_or(""))?
             .await?;
         let (guard, _rx, udp) = Self::auth(&session, &self.opts.passwd).await?;
-        *self.support_udp.write().unwrap() = udp;
+        let mut udp_guard = self.support_udp.write().unwrap_or_else(|e| {
+            warn!("hysteria2 support_udp lock poisoned");
+            e.into_inner()
+        });
+        *udp_guard = udp;
         // todo set congestion controller according to cc_rx
 
         match session
@@ -366,7 +370,11 @@ impl OutboundHandler for Handler {
     }
 
     async fn support_udp(&self) -> bool {
-        *self.support_udp.read().unwrap()
+        let udp_guard = self.support_udp.read().unwrap_or_else(|e| {
+            warn!("hysteria2 support_udp lock poisoned");
+            e.into_inner()
+        });
+        *udp_guard
     }
 
     async fn support_connector(&self) -> ConnectorType {

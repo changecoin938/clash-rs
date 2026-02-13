@@ -93,6 +93,8 @@ pub struct Handler {
     proxy_manager: ProxyManager,
     /// Centralized state management
     smart_state: Arc<tokio::sync::Mutex<SmartState>>,
+    /// Background persistence task (aborted on drop)
+    persist_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -102,6 +104,14 @@ impl std::fmt::Debug for Handler {
             .field("udp", &self.opts.udp)
             .field("max_retries", &self.opts.max_retries)
             .finish()
+    }
+}
+
+impl Drop for Handler {
+    fn drop(&mut self) {
+        if let Some(handle) = self.persist_task.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -115,45 +125,40 @@ impl Handler {
     ) -> Self {
         let group_name = opts.name.clone();
 
-        let thread_group_name = group_name.clone();
-        let thread_cache_store = cache_store.clone();
+        let smart_state = Arc::new(tokio::sync::Mutex::new(SmartState::new()));
 
-        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        let cache_store_clone = cache_store.clone();
+        let group_name_clone = group_name.clone();
+        let state_clone = Arc::clone(&smart_state);
+        tokio::spawn(async move {
+            info!(
+                "{} attempting to load smart stats from cache",
+                group_name_clone
+            );
+            let stored_data: Option<state::SmartStateData> =
+                cache_store_clone.get_smart_stats(&group_name_clone).await;
 
-        std::thread::spawn(move || {
-            let rt =
-                tokio::runtime::Runtime::new().expect("Failed to create runtime");
-            let state = rt.block_on(async {
+            if let Some(stored_data) = stored_data {
                 info!(
-                    "{} attempting to load smart stats from cache",
-                    thread_group_name
+                    "{} successfully loaded smart stats from cache",
+                    group_name_clone
                 );
-                let stored_data: Option<state::SmartStateData> =
-                    thread_cache_store.get_smart_stats(&thread_group_name).await;
-
-                if stored_data.is_some() {
-                    info!(
-                        "{} successfully loaded smart stats from cache",
-                        thread_group_name
-                    );
-                } else {
-                    info!(
-                        "{} no smart stats found in cache, initializing new state",
-                        thread_group_name
-                    );
-                }
-                SmartState::new_with_imported_data(stored_data)
-            });
-
-            tx.send(state).expect("Failed to send smart state");
+                let mut guard = state_clone.lock().await;
+                *guard = SmartState::new_with_imported_data(Some(stored_data));
+            } else {
+                info!(
+                    "{} no smart stats found in cache, initializing new state",
+                    group_name_clone
+                );
+            }
         });
-        let smart_state = rx.recv().expect("Failed to receive smart state");
 
-        let handler = Self {
+        let mut handler = Self {
             opts,
             providers,
             proxy_manager,
-            smart_state: Arc::new(tokio::sync::Mutex::new(smart_state)),
+            smart_state,
+            persist_task: None,
         };
 
         // Set up periodic persistence for smart_stats
@@ -161,7 +166,7 @@ impl Handler {
         let group_name_clone = group_name.clone();
         let state_clone = Arc::clone(&handler.smart_state);
 
-        tokio::spawn(async move {
+        let persist_task = tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(30));
             loop {
@@ -177,6 +182,7 @@ impl Handler {
                 save_stats_fut.await;
             }
         });
+        handler.persist_task = Some(persist_task);
 
         handler
     }

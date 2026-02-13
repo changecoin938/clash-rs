@@ -2,6 +2,7 @@ mod stream;
 
 use arti_client::{StreamPrefs, TorClientConfig};
 use async_trait::async_trait;
+use std::io;
 
 use crate::{
     app::{
@@ -36,15 +37,13 @@ impl std::fmt::Debug for Handler {
 }
 
 impl Handler {
-    pub fn new(opts: HandlerOptions) -> Self {
-        Self {
-            opts,
-            client: arti_client::TorClient::builder()
-                .config(TorClientConfig::default())
-                .bootstrap_behavior(arti_client::BootstrapBehavior::OnDemand)
-                .create_unbootstrapped()
-                .unwrap(),
-        }
+    pub fn new(opts: HandlerOptions) -> io::Result<Self> {
+        let client = arti_client::TorClient::builder()
+            .config(TorClientConfig::default())
+            .bootstrap_behavior(arti_client::BootstrapBehavior::OnDemand)
+            .create_unbootstrapped()
+            .map_err(|e| new_io_error(e.to_string()))?;
+        Ok(Self { opts, client })
     }
 }
 

@@ -15,9 +15,13 @@ impl TryFrom<&OutboundTor> for Handler {
     type Error = crate::Error;
 
     fn try_from(s: &OutboundTor) -> Result<Self, Self::Error> {
-        let h = Handler::new(HandlerOptions {
+        Handler::new(HandlerOptions {
             name: s.name.to_owned(),
-        });
-        Ok(h)
+        })
+        .map_err(|e| {
+            crate::Error::InvalidConfig(format!(
+                "failed to initialize tor client: {e}"
+            ))
+        })
     }
 }

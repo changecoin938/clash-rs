@@ -29,14 +29,9 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
 
     fn try_from(s: &OutboundShadowsocks) -> Result<Self, Self::Error> {
         let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
-        if skip_cert_verify {
-            warn!(
-                "skipping TLS cert verification for {}",
-                s.common_opts.server
-            );
-        }
-        
-        let mut plugin_includes_tls = false;
+
+        let mut plugin_disables_outer_tls = false;
+        let plugin_name = s.plugin.as_deref().unwrap_or_default();
 
         let h = Handler::new(HandlerOptions {
             name: s.common_opts.name.to_owned(),
@@ -88,7 +83,10 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
                             ))
                         });
                         let opt: V2RayOBFSOption = opt_map.try_into()?;
-                        plugin_includes_tls = opt.tls;
+                        // v2ray-plugin performs its own websocket (and optional TLS)
+                        // handshake. Wrapping it with an extra outer TLS breaks the
+                        // protocol.
+                        plugin_disables_outer_tls = true;
                         // TODO: support more transport options, replace it with
                         // `V2rayClient`
                         let plugin = V2rayWsClient::try_from(opt)?;
@@ -102,6 +100,8 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
                                 "plugin-opts is required for shadow-tls".to_owned(),
                             ))?
                             .try_into()?;
+                        // shadow-tls performs its own TLS handshake.
+                        plugin_disables_outer_tls = true;
                         Some(Box::new(plugin) as _)
                     }
                     _ => {
@@ -115,13 +115,20 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
             udp: s.udp,
             tls: match s.tls.unwrap_or_default() {
                 true => {
-                    if plugin_includes_tls {
+                    if plugin_disables_outer_tls {
                         warn!(
-                            "ignoring outer tls for {} because v2ray-plugin already enables tls",
-                            s.common_opts.server
+                            "tls: true ignored for {}, because plugin {} performs its own transport/TLS handshake",
+                            s.common_opts.server,
+                            plugin_name
                         );
                         None
                     } else {
+                    if skip_cert_verify {
+                        warn!(
+                            "skipping TLS cert verification for {}",
+                            s.common_opts.server
+                        );
+                    }
                     let alpn = s.alpn.clone().map(|list| {
                         list.into_iter()
                             .map(|v| v.trim().to_owned())
