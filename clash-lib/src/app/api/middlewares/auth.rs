@@ -74,11 +74,26 @@ where
             .unwrap();
 
         if self.is_websocket(&req) {
+            // Legacy browser support: token in query string.
             let q = Query::<AuthQuery>::try_from_uri(req.uri()).ok();
             if let Some(q) = q
                 && q.token == self.token
             {
                 return Box::pin(self.inner.call(req));
+            }
+
+            // Preferred for non-browser clients: token via Sec-WebSocket-Protocol.
+            if let Some(proto) =
+                req.headers().get(http::header::SEC_WEBSOCKET_PROTOCOL)
+            {
+                if let Ok(proto) = proto.to_str()
+                    && proto
+                        .split(',')
+                        .map(|p| p.trim())
+                        .any(|p| p == self.token)
+                {
+                    return Box::pin(self.inner.call(req));
+                }
             }
         }
 

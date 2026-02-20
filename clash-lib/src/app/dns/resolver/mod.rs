@@ -30,7 +30,9 @@ pub async fn new(
         }
     } else {
         Arc::new(
-            SystemResolver::new(cfg.ipv6).expect("failed to create system resolver"),
+            SystemResolver::new(cfg.ipv6).unwrap_or_else(|e| {
+                print_and_exit!("failed to create system resolver: {e}")
+            }),
         )
     }
 }

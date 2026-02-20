@@ -18,7 +18,6 @@ pub async fn handle() -> impl IntoResponse {
 
                     let err = std::process::Command::new(exec)
                         .args(std::env::args().skip(1))
-                        .envs(std::env::vars())
                         .exec();
                     info!("process restarted: {}", err);
                 }
@@ -28,7 +27,6 @@ pub async fn handle() -> impl IntoResponse {
 
                     match std::process::Command::new(exec)
                         .args(std::env::args().skip(1))
-                        .envs(std::env::vars())
                         .stdin(std::process::Stdio::inherit())
                         .stdout(std::process::Stdio::inherit())
                         .stderr(std::process::Stdio::inherit())

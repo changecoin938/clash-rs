@@ -48,12 +48,14 @@ pub fn get_api_runner(
     cache_store: ThreadSafeCacheFile,
     router: ThreadSafeRouter,
     cwd: String,
-) -> Option<Runner> {
+    ) -> Option<Runner> {
     if let Some(bind_addr) = controller_cfg.external_controller {
         let app_state = Arc::new(AppState {
             log_source_tx: log_source,
             statistics_manager: statistics_manager.clone(),
         });
+
+        let secret = controller_cfg.secret.clone().unwrap_or_default();
 
         let origins: AllowOrigin =
             if let Some(origins) = &controller_cfg.cors_allow_origins {
@@ -68,6 +70,18 @@ pub fn get_api_runner(
                     })
                     .collect::<Vec<_>>()
                     .into()
+            } else if secret.is_empty() {
+                // When no secret is set, do not allow any website to access the API by default.
+                // Only permit loopback origins.
+                AllowOrigin::predicate(|origin, _| {
+                    let origin = origin.as_bytes();
+                    origin.starts_with(b"http://localhost")
+                        || origin.starts_with(b"https://localhost")
+                        || origin.starts_with(b"http://127.0.0.1")
+                        || origin.starts_with(b"https://127.0.0.1")
+                        || origin.starts_with(b"http://[::1]")
+                        || origin.starts_with(b"https://[::1]")
+                })
             } else {
                 Any.into()
             };
@@ -119,7 +133,7 @@ pub fn get_api_runner(
                 )
                 .nest("/dns", handlers::dns::routes(dns_resolver))
                 .route_layer(middlewares::auth::AuthMiddlewareLayer::new(
-                    controller_cfg.secret.clone().unwrap_or_default(),
+                    secret.clone(),
                 ))
                 .layer(middleware::from_fn(
                     middlewares::fix_json_content_type::fix_content_type,

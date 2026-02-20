@@ -85,6 +85,7 @@ impl Dispatcher {
                 Some(dest) => dest,
                 None => {
                     warn!("failed to resolve destination {}", sess);
+                    let _ = lhs.shutdown().await;
                     return;
                 }
             };
@@ -103,7 +104,11 @@ impl Dispatcher {
         let mgr = self.outbound_manager.clone();
         let handler = mgr.get_outbound(outbound_name).unwrap_or_else(|| {
             debug!("unknown rule: {}, fallback to direct", outbound_name);
-            mgr.get_outbound(PROXY_DIRECT).unwrap()
+            mgr.get_outbound(PROXY_DIRECT).unwrap_or_else(|| {
+                panic!(
+                    "DIRECT outbound not found — this is a bug in initialization"
+                )
+            })
         });
 
         match handler
@@ -294,7 +299,9 @@ impl Dispatcher {
                             "unknown rule: {}, fallback to direct",
                             outbound_name
                         );
-                        mgr.get_outbound(PROXY_DIRECT).unwrap()
+                        mgr.get_outbound(PROXY_DIRECT).unwrap_or_else(|| {
+                            panic!("DIRECT outbound not found — this is a bug in initialization")
+                        })
                     });
 
                 let outbound_name =

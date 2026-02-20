@@ -90,30 +90,33 @@ impl Router {
             if sess.destination.is_domain()
                 && r.should_resolve_ip()
                 && !sess_resolved
+                && let Some(domain) = sess.destination.domain()
                 && let Ok(Some(ip)) = self
                     .dns_resolver
-                    .resolve(sess.destination.domain().unwrap(), false)
+                    .resolve(domain, false)
                     .await
             {
                 sess.resolved_ip = Some(ip);
                 sess_resolved = true;
             }
 
-            let maybe_ip = sess.resolved_ip.or(sess.destination.ip());
-            if let (Some(ip), Some(asn_mmdb)) = (maybe_ip, &self.asn_mmdb) {
-                // try simplified mmdb first
-                let rv = asn_mmdb.lookup_country(ip);
-                if let Ok(country) = rv {
-                    sess.asn = Some(country.country_code);
-                }
-                if sess.asn.is_none() {
-                    match asn_mmdb.lookup_asn(ip) {
-                        Ok(asn) => {
-                            trace!("asn for {} is {:?}", ip, asn);
-                            sess.asn = Some(asn.asn_name);
-                        }
-                        Err(e) => {
-                            trace!("failed to lookup ASN for {}: {}", ip, e);
+            if sess.asn.is_none() {
+                let maybe_ip = sess.resolved_ip.or(sess.destination.ip());
+                if let (Some(ip), Some(asn_mmdb)) = (maybe_ip, &self.asn_mmdb) {
+                    // try simplified mmdb first
+                    let rv = asn_mmdb.lookup_country(ip);
+                    if let Ok(country) = rv {
+                        sess.asn = Some(country.country_code);
+                    }
+                    if sess.asn.is_none() {
+                        match asn_mmdb.lookup_asn(ip) {
+                            Ok(asn) => {
+                                trace!("asn for {} is {:?}", ip, asn);
+                                sess.asn = Some(asn.asn_name);
+                            }
+                            Err(e) => {
+                                trace!("failed to lookup ASN for {}: {}", ip, e);
+                            }
                         }
                     }
                 }
@@ -151,7 +154,7 @@ impl Router {
                         http.path,
                         Some(cwd.clone()),
                         resolver.clone(),
-                    );
+                    )?;
 
                     // Default to yaml if not specified
                     let format = http.format.unwrap_or_default();
@@ -169,12 +172,9 @@ impl Router {
                     rule_provider_registry.insert(name, Arc::new(provider));
                 }
                 RuleProviderDef::File(file) => {
-                    let vehicle = file_vehicle::Vehicle::new(
-                        PathBuf::from(cwd.clone())
-                            .join(&file.path)
-                            .to_str()
-                            .unwrap(),
-                    );
+                    let vehicle_path = PathBuf::from(cwd.clone()).join(&file.path);
+                    let vehicle_path = vehicle_path.to_string_lossy();
+                    let vehicle = file_vehicle::Vehicle::new(vehicle_path.as_ref());
 
                     // Default to yaml if not specified
                     let format = file.format.unwrap_or_default();

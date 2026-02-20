@@ -37,7 +37,19 @@ impl PlainAuthenticator {
 impl Authenticator for PlainAuthenticator {
     fn authenticate(&self, username: &str, password: &str) -> bool {
         match self.store.get(username) {
-            Some(p) => p == password,
+            Some(p) => {
+                let p_bytes = p.as_bytes();
+                let pwd_bytes = password.as_bytes();
+                if p_bytes.len() != pwd_bytes.len() {
+                    return false;
+                }
+
+                let diff = p_bytes
+                    .iter()
+                    .zip(pwd_bytes.iter())
+                    .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+                diff == 0
+            }
             None => false,
         }
     }

@@ -128,28 +128,23 @@ impl DhcpClient {
             self.iface
         )))?;
 
+        let netmask = iface.netmask_v4.ok_or(io::Error::other(format!(
+            "no netmask on iface: {:?}",
+            self.iface
+        )))?;
+
         if Instant::now() < inner.dns_expires_at
             && inner.iface_addr.addr() == addr
-            && inner.iface_addr.netmask()
-                == iface.netmask_v4.ok_or(io::Error::other(format!(
-                    "no netmask on iface: {:?}",
-                    self.iface
-                )))?
+            && inner.iface_addr.netmask() == netmask
         {
             Ok(false)
         } else {
             inner.dns_expires_at = Instant::now().add(DHCP_TTL);
             inner.iface_addr = ipnet::IpNet::new(
                 addr.into(),
-                u32::from(iface.netmask_v4.ok_or(io::Error::other("no netmask"))?)
-                    .count_ones() as _,
+                u32::from(netmask).count_ones() as _,
             )
-            .map_err(|_x| {
-                io::Error::other(format!(
-                    "invalid netmask: {}",
-                    iface.netmask_v4.expect("expect netmask parse error")
-                ))
-            })?;
+            .map_err(|_x| io::Error::other(format!("invalid netmask: {netmask}")))?;
             Ok(true)
         }
     }
@@ -162,7 +157,11 @@ async fn listen_dhcp_client(iface: &OutboundInterface) -> io::Result<UdpSocket> 
     };
 
     new_udp_socket(
-        Some(listen_addr.parse().expect("must parse")),
+        Some(listen_addr.parse().map_err(|e| {
+            io::Error::other(format!(
+                "invalid DHCP listen addr {listen_addr}: {e}"
+            ))
+        })?),
         Some(iface),
         #[cfg(target_os = "linux")]
         None,
@@ -204,7 +203,7 @@ async fn probe_dns_server(iface: &OutboundInterface) -> io::Result<Vec<Ipv4Addr>
             dhcproto::v4::OptionCode::DomainName,
         ]));
 
-    let (mut tx, rx) = tokio::sync::oneshot::channel::<Vec<Ipv4Addr>>();
+    let (mut tx, rx) = tokio::sync::oneshot::channel::<io::Result<Vec<Ipv4Addr>>>();
 
     let mut rx = rx.fuse();
 
@@ -217,10 +216,7 @@ async fn probe_dns_server(iface: &OutboundInterface) -> io::Result<Vec<Ipv4Addr>
 
         let get_response = async move {
             loop {
-                let (n_read, _) = r
-                    .recv_from(&mut buf)
-                    .await
-                    .expect("failed to receive DHCP offer");
+                let (n_read, _) = r.recv_from(&mut buf).await?;
 
                 // fucking deep if-else hell
                 if let Ok(reply) = dhcproto::v4::Message::from_bytes(&buf[..n_read])
@@ -241,7 +237,7 @@ async fn probe_dns_server(iface: &OutboundInterface) -> io::Result<Vec<Ipv4Addr>
                                                         "got NS servers {:?} from DHCP",
                                                         dns
                                                     );
-                                                    return dns.clone();
+                                                    return Ok(dns.clone());
                                                 }
                                                 _ => yield_now().await,
                                             }
@@ -261,12 +257,14 @@ async fn probe_dns_server(iface: &OutboundInterface) -> io::Result<Vec<Ipv4Addr>
         }
     });
 
-    s.send_to(&msg.to_vec().expect("must encode"), "255.255.255.255:67")
-        .await?;
+    let msg = msg
+        .to_vec()
+        .map_err(|e| io::Error::other(format!("DHCP encode error: {e}")))?;
+    s.send_to(&msg, "255.255.255.255:67").await?;
 
     tokio::select! {
         result = &mut rx => {
-            result.map_err(|_x| io::Error::other("channel error"))
+            result.map_err(|_x| io::Error::other("channel error"))?
         },
 
         _ = tokio::time::sleep(Duration::from_secs(10)) => {

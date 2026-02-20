@@ -102,20 +102,19 @@ impl Sink<UdpPacket> for OutboundDatagramVless {
             ));
         }
 
-        // Handle large packets by chunking them
         let total_len = item.data.len();
         if total_len == 0 {
             return Ok(()); // Skip empty packets
         }
 
-        // For now, handle first chunk or small packets
-        let chunk_size = if total_len <= MAX_PACKET_LENGTH {
-            total_len
-        } else {
-            MAX_PACKET_LENGTH
-        };
+        if total_len > MAX_PACKET_LENGTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("packet too large: {} > {}", total_len, MAX_PACKET_LENGTH),
+            ));
+        }
 
-        this.write_packet(&item.data[..chunk_size])?;
+        this.write_packet(&item.data)?;
         this.pending_packet = Some(item);
         this.flushed = false;
 

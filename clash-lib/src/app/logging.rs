@@ -209,9 +209,15 @@ fn setup_logging_inner(
     #[cfg(feature = "tracing")]
     let subscriber = subscriber.with(console_subscriber::spawn());
     #[cfg(feature = "tracing")]
-    let filter = filter
-        .add_directive("tokio=trace".parse().unwrap())
-        .add_directive("runtime=trace".parse().unwrap());
+    let filter = match "tokio=trace".parse() {
+        Ok(directive) => filter.add_directive(directive),
+        Err(_) => filter,
+    };
+    #[cfg(feature = "tracing")]
+    let filter = match "runtime=trace".parse() {
+        Ok(directive) => filter.add_directive(directive),
+        Err(_) => filter,
+    };
     let exclude = filter_fn(|metadata| {
         !metadata.target().contains("tokio")
             && !metadata.target().contains("runtime")
@@ -284,31 +290,31 @@ struct EventVisitor<'a>(&'a mut Vec<String>);
 
 impl tracing::field::Visit for EventVisitor<'_> {
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        println!("f64 {} = {}", field.name(), value);
+        self.0.push(format!("{} = {}", field.name(), value));
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        println!("i64 {} = {}", field.name(), value);
+        self.0.push(format!("{} = {}", field.name(), value));
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        println!("u64 {} = {}", field.name(), value);
+        self.0.push(format!("{} = {}", field.name(), value));
     }
 
     fn record_i128(&mut self, field: &tracing::field::Field, value: i128) {
-        println!("i128 {} = {}", field.name(), value);
+        self.0.push(format!("{} = {}", field.name(), value));
     }
 
     fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
-        println!("u128 {} = {}", field.name(), value);
+        self.0.push(format!("{} = {}", field.name(), value));
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        println!("bool {} = {}", field.name(), value);
+        self.0.push(format!("{} = {}", field.name(), value));
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        println!("str {} = {}", field.name(), value);
+        self.0.push(format!("{} = {}", field.name(), value));
     }
 
     fn record_error(
@@ -316,7 +322,7 @@ impl tracing::field::Visit for EventVisitor<'_> {
         field: &tracing::field::Field,
         value: &(dyn std::error::Error + 'static),
     ) {
-        println!("error {} = {}", field.name(), value);
+        self.0.push(format!("{} = {}", field.name(), value));
     }
 
     fn record_debug(
@@ -327,7 +333,7 @@ impl tracing::field::Visit for EventVisitor<'_> {
         if field.name() == "message" {
             self.0.push(format!("{value:?}"));
         } else {
-            println!("debug {} = {:?}", field.name(), value);
+            self.0.push(format!("{} = {:?}", field.name(), value));
         }
     }
 }

@@ -1,7 +1,7 @@
 use byteorder::{BigEndian, ReadBytesExt};
 use hmac::Mac;
 use sha2::{Digest, Sha256};
-use std::{io::Read, ptr::copy_nonoverlapping};
+use std::io::Read;
 
 use super::prelude::*;
 
@@ -37,13 +37,7 @@ impl Hmac {
         let hmac = self.0.clone();
         let hash = hmac.finalize().into_bytes();
         let mut res = [0; HMAC_SIZE];
-        unsafe {
-            copy_nonoverlapping(
-                hash.as_slice().as_ptr(),
-                res.as_mut_ptr(),
-                HMAC_SIZE,
-            )
-        };
+        res.copy_from_slice(&hash.as_slice()[..HMAC_SIZE]);
         res
     }
 

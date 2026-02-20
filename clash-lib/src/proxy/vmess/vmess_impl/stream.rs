@@ -65,6 +65,15 @@ impl<S> Debug for VmessStream<S> {
     }
 }
 
+impl<S> Drop for VmessStream<S> {
+    fn drop(&mut self) {
+        self.req_body_iv.fill(0);
+        self.req_body_key.fill(0);
+        self.resp_body_iv.fill(0);
+        self.resp_body_key.fill(0);
+    }
+}
+
 enum ReadState {
     AeadWaitingHeaderSize,
     AeadWaitingHeader(usize),
@@ -210,14 +219,20 @@ where
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("check your system clock")
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "system clock error",
+                )
+            })?
             .as_secs();
 
         let mut mbuf = BytesMut::new();
 
         if !is_aead {
-            let mut mac = HmacMd5::new_from_slice(id.uuid.as_bytes())
-                .expect("key len expected to be 16");
+            let mut mac = HmacMd5::new_from_slice(id.uuid.as_bytes()).map_err(
+                |_| std::io::Error::other("hmac init failed"),
+            )?;
             mac.update(now.to_be_bytes().as_slice());
             mbuf.put_slice(&mac.finalize().into_bytes());
         }

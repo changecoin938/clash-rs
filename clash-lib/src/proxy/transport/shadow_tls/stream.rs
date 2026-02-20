@@ -1,4 +1,3 @@
-use byteorder::{BigEndian, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use std::{
     pin::Pin,
@@ -159,11 +158,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for ProxyTlsStream<S> {
                                     // 2. remove the hmac
                                     body.copy_within(HMAC_SIZE.., 0);
                                     // 3. rewrite the data size in the header
-                                    (&mut header[3..5])
-                                        .write_u16::<BigEndian>(
-                                            size as u16 - HMAC_SIZE as u16,
-                                        )
-                                        .unwrap();
+                                    let new_size =
+                                        size as u16 - HMAC_SIZE as u16;
+                                    header[3..5].copy_from_slice(
+                                        &new_size.to_be_bytes(),
+                                    );
                                     this.read_authorized = true;
                                     // 4. rewrite the body length to be put into the
                                     //    read buf
@@ -372,9 +371,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VerifiedStream<S> {
                     let mut header_body = Vec::with_capacity(COPY_BUF_SIZE);
                     header_body.extend_from_slice(&DEFAULT_HEADER_HMAC);
 
-                    (&mut header_body[3..5])
-                        .write_u16::<BigEndian>((buf.len() + HMAC_SIZE) as u16)
-                        .unwrap();
+                    let record_len = (buf.len() + HMAC_SIZE) as u16;
+                    header_body[3..5].copy_from_slice(&record_len.to_be_bytes());
                     header_body.extend_from_slice(buf);
 
                     this.client_cert.update(buf);

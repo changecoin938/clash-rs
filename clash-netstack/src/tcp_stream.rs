@@ -71,12 +71,7 @@ impl tokio::io::AsyncRead for TcpStream {
             return std::task::Poll::Pending;
         }
 
-        buf.initialize_unfilled();
-        let recv_buf = unsafe {
-            std::mem::transmute::<&mut [std::mem::MaybeUninit<u8>], &mut [u8]>(
-                buf.unfilled_mut(),
-            )
-        };
+        let recv_buf = buf.initialize_unfilled();
         let n = read_buf.dequeue_slice(recv_buf);
         buf.advance(n);
 

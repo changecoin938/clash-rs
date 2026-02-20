@@ -110,12 +110,36 @@ async fn update_configs(
             }
         }
         (Some(mut path), None) => {
-            if !PathBuf::from(&path).is_absolute() {
-                path = PathBuf::from(g.cwd.clone())
-                    .join(path)
-                    .to_string_lossy()
-                    .to_string();
+            let cwd = PathBuf::from(g.cwd.clone());
+            let path_buf = PathBuf::from(&path);
+            let is_absolute = path_buf.is_absolute();
+            let joined = if is_absolute { path_buf } else { cwd.join(&path) };
+
+            let canonical = match std::fs::canonicalize(&joined) {
+                Ok(p) => p,
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("config file {path} not found"),
+                    )
+                        .into_response();
+                }
+            };
+
+            if !is_absolute {
+                let cwd_canonical =
+                    std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+                if !canonical.starts_with(&cwd_canonical) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "config path must be within working directory".to_string(),
+                    )
+                        .into_response();
+                }
             }
+
+            path = canonical.to_string_lossy().to_string();
+
             if !PathBuf::from(&path).exists() {
                 return (
                     StatusCode::BAD_REQUEST,

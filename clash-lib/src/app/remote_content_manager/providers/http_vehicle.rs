@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 pub struct Vehicle {
     pub url: Uri,
     pub path: PathBuf,
+    path_str: String,
     http_client: HttpClient,
 }
 
@@ -30,18 +31,20 @@ impl Vehicle {
         path: P,
         cwd: Option<P>,
         dns_resolver: ThreadSafeDNSResolver,
-    ) -> Self {
+    ) -> io::Result<Self> {
         // TODO(dev0): support remote content manager via proxy
-        let client = new_http_client(dns_resolver, None)
-            .expect("failed to create http client");
-        Self {
+        let client = new_http_client(dns_resolver, None)?;
+        let path = match cwd {
+            Some(cwd) => cwd.as_ref().join(path),
+            None => path.as_ref().to_path_buf(),
+        };
+        let path_str = path.to_string_lossy().into_owned();
+        Ok(Self {
             url: url.into(),
-            path: match cwd {
-                Some(cwd) => cwd.as_ref().join(path),
-                None => path.as_ref().to_path_buf(),
-            },
+            path,
+            path_str,
             http_client: client,
-        }
+        })
     }
 }
 
@@ -51,7 +54,7 @@ impl ProviderVehicle for Vehicle {
         let mut req = Request::default();
         req.headers_mut().insert(
             http::header::USER_AGENT,
-            DEFAULT_USER_AGENT.parse().expect("must parse user agent"),
+            http::HeaderValue::from_static(DEFAULT_USER_AGENT),
         );
         *req.body_mut() = http_body_util::Empty::<bytes::Bytes>::new();
         *req.uri_mut() = self.url.clone();
@@ -67,7 +70,7 @@ impl ProviderVehicle for Vehicle {
     }
 
     fn path(&self) -> &str {
-        self.path.to_str().unwrap()
+        self.path_str.as_str()
     }
 
     fn typ(&self) -> ProviderVehicleType {
@@ -93,7 +96,9 @@ mod tests {
             .unwrap();
         let p = std::env::temp_dir().join("test_http_vehicle");
         let r = Arc::new(EnhancedResolver::new_default().await);
-        let v = super::Vehicle::new(u, p, None, r.clone() as ThreadSafeDNSResolver);
+        let v =
+            super::Vehicle::new(u, p, None, r.clone() as ThreadSafeDNSResolver)
+                .unwrap();
 
         let data = v.read().await.unwrap();
         assert_eq!(str::from_utf8(&data).unwrap(), "HTTPBIN is awesome");

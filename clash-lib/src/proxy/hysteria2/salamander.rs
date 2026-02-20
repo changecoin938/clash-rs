@@ -147,11 +147,8 @@ fn test_skip() {
         obfs.decrypt(v);
         let data: &mut [u8] = v.as_mut();
         let data = &mut data[8..];
-        unsafe {
-            let b: IoSliceMut<'_> = std::mem::transmute(data);
-            *v = b;
-        }
-        println!("{:?}", v);
+        let shrunk = IoSliceMut::new(data);
+        println!("{:?}", shrunk);
     });
 }
 

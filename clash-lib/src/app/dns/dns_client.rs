@@ -313,12 +313,16 @@ impl Client for DnsClient {
         if req.id() == 0 {
             req.set_id(rand::random::<u16>());
         }
-        self.inner
-            .read()
-            .await
-            .c
-            .as_ref()
-            .unwrap()
+
+        let client = {
+            let inner = self.inner.read().await;
+            inner
+                .c
+                .clone()
+                .ok_or_else(|| Error::DNSError("DNS client not initialized".into()))?
+        };
+
+        client
             .send(req)
             .first_answer()
             .await

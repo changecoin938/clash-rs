@@ -1,8 +1,11 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
-    Json, Router,
-    extract::{Query, State},
+    Json, Router, middleware,
+    extract::{Query, Request, State},
     response::IntoResponse,
     routing::get,
 };
@@ -19,10 +22,60 @@ struct DNSState {
     resolver: ThreadSafeDNSResolver,
 }
 
+#[derive(Clone)]
+struct QueryRateLimiter {
+    inner: Arc<tokio::sync::Mutex<RateLimitState>>,
+    max: u64,
+    per: Duration,
+}
+
+#[derive(Debug)]
+struct RateLimitState {
+    window_start: Instant,
+    count: u64,
+}
+
+impl QueryRateLimiter {
+    fn new(max: u64, per: Duration) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(RateLimitState {
+                window_start: Instant::now(),
+                count: 0,
+            })),
+            max,
+            per,
+        }
+    }
+}
+
+async fn rate_limit(
+    State(limiter): State<QueryRateLimiter>,
+    req: Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let mut state = limiter.inner.lock().await;
+    let now = Instant::now();
+    if now.duration_since(state.window_start) >= limiter.per {
+        state.window_start = now;
+        state.count = 0;
+    }
+
+    if state.count >= limiter.max {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded")
+            .into_response();
+    }
+    state.count += 1;
+    drop(state);
+
+    next.run(req).await
+}
+
 pub fn routes(resolver: ThreadSafeDNSResolver) -> Router<Arc<AppState>> {
     let state = DNSState { resolver };
+    let limiter = QueryRateLimiter::new(10, Duration::from_secs(1));
     Router::new()
         .route("/query", get(query_dns))
+        .route_layer(middleware::from_fn_with_state(limiter, rate_limit))
         .with_state(state)
 }
 

@@ -166,8 +166,10 @@ fn parse_ipcidr_payload<R: Read>(reader: &mut R) -> Result<RuleContent> {
             .read_exact(&mut range_buf)
             .with_context(|| format!("Failed to read IP range #{i}"))?;
 
-        let from_ip_bytes: [u8; 16] = range_buf[0..16].try_into().unwrap();
-        let to_ip_bytes: [u8; 16] = range_buf[16..32].try_into().unwrap();
+        let mut from_ip_bytes = [0u8; 16];
+        from_ip_bytes.copy_from_slice(&range_buf[0..16]);
+        let mut to_ip_bytes = [0u8; 16];
+        to_ip_bytes.copy_from_slice(&range_buf[16..32]);
         let from_ip = IpAddr::from(from_ip_bytes);
         let to_ip = IpAddr::from(to_ip_bytes);
 

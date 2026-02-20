@@ -33,6 +33,7 @@ impl HttpClient {
         let mut tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(GLOBAL_ROOT_STORE.clone())
             .with_no_client_auth();
+        #[cfg(debug_assertions)]
         if std::env::var("SSLKEYLOGFILE").is_ok() {
             tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
         }

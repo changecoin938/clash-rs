@@ -22,22 +22,44 @@ impl FromStr for SocksAddr {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut s = s.to_string();
-        if !s.contains(':') {
-            s = format!("{s}:80");
+        let s = s.to_string();
+
+        // Fast path: socket address (e.g. "127.0.0.1:80", "[::1]:80")
+        if let Ok(v) = SocketAddr::from_str(&s) {
+            return Ok(Self::Ip(v));
         }
-        match SocketAddr::from_str(&s) {
-            Ok(v) => Ok(Self::Ip(v)),
-            Err(_) => {
-                let tokens: Vec<_> = s.split(':').collect();
-                if tokens.len() == 2 {
-                    let port: u16 = tokens.get(1).unwrap().parse()?;
-                    Ok(Self::Domain(tokens.first().unwrap().to_string(), port))
-                } else {
-                    Err(anyhow!("SocksAddr parse error, value: {s}"))
+
+        // Bare IP address (IPv4/IPv6), default port 80.
+        if let Ok(ip) = s.parse::<IpAddr>() {
+            return Ok(Self::Ip(SocketAddr::new(ip, 80)));
+        }
+
+        // Host:port (domain or bracketed IPv6)
+        if let Some((host, port_str)) = s.rsplit_once(':')
+            && let Ok(port) = port_str.parse::<u16>()
+        {
+            // Bracketed IPv6.
+            if host.starts_with('[') && host.ends_with(']') {
+                let ip_str = &host[1..host.len() - 1];
+                if let Ok(ip) = ip_str.parse::<Ipv6Addr>() {
+                    return Ok(Self::Ip(SocketAddr::new(IpAddr::V6(ip), port)));
                 }
             }
+
+            // Domains cannot contain ':'; reject unbracketed IPv6-with-port like "::1:80".
+            if host.contains(':') || host.is_empty() {
+                return Err(anyhow!("SocksAddr parse error, value: {s}"));
+            }
+
+            return Ok(Self::Domain(host.to_string(), port));
         }
+
+        // Bare domain without port, default port 80.
+        if !s.contains(':') {
+            return Ok(Self::Domain(s, 80));
+        }
+
+        Err(anyhow!("SocksAddr parse error, value: {s}"))
     }
 }
 #[test]
@@ -47,6 +69,9 @@ fn test_from_str() {
         SocksAddr::Ip(SocketAddr::V4("127.0.0.1:80".parse().unwrap()))
     );
     assert!(SocksAddr::from_str("127.0.0.1:80").is_ok());
+    assert!(SocksAddr::from_str("::1").is_ok());
+    assert!(SocksAddr::from_str("[::1]:80").is_ok());
+    assert!(SocksAddr::from_str("::1:80").is_err());
     assert!(SocksAddr::from_str("hosta.com").is_ok());
     assert!(SocksAddr::from_str("hosta.com:443").is_ok());
     assert!(SocksAddr::from_str("hosta.:com:443").is_err());
@@ -329,17 +354,18 @@ impl TryFrom<&[u8]> for SocksAddr {
             }
 
             SocksAddrType::DOMAIN => {
-                if buf.is_empty() {
+                if buf.len() < 2 {
                     return Err(insuff_bytes());
                 }
                 let domain_len = buf[1] as usize;
-                if buf.len() < 1 + domain_len + 2 {
+                if buf.len() < 2 + domain_len + 2 {
                     return Err(insuff_bytes());
                 }
-                let domain = String::from_utf8((buf[2..domain_len + 2]).to_vec())
+                let domain =
+                    String::from_utf8(buf[2..domain_len + 2].to_vec())
                     .map_err(|e| io::Error::other(format!("invalid domain: {e}")))?;
                 let mut port_bytes = [0u8; 2];
-                (port_bytes).copy_from_slice(&buf[domain_len + 2..domain_len + 4]);
+                port_bytes.copy_from_slice(&buf[domain_len + 2..domain_len + 4]);
                 let port = u16::from_be_bytes(port_bytes);
                 Ok(Self::Domain(domain, port))
             }

@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, metadata},
+    fs::{self},
     path::Path,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -13,6 +13,8 @@ use tracing::{info, trace, warn};
 use crate::common::utils;
 
 use super::{ProviderVehicleType, ThreadSafeProviderVehicle};
+
+const MAX_PROVIDER_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
 
 struct Inner {
     updated_at: SystemTime,
@@ -79,14 +81,15 @@ where
 
         let mut inner = self.inner.write().await;
 
-        let content = match metadata(&vehicle_path) {
-            Ok(meta) => {
-                let content = fs::read(&vehicle_path)?;
+        let content = match fs::read(&vehicle_path) {
+            Ok(content) => {
                 is_local = true;
-                inner.updated_at = meta.modified()?;
+                inner.updated_at = fs::metadata(&vehicle_path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::now());
                 immediately_update = SystemTime::now()
                     .duration_since(inner.updated_at)
-                    .expect("wrong system clock")
+                    .unwrap_or_default()
                     > self.interval;
                 content
             }
@@ -107,18 +110,28 @@ where
         };
 
         if self.vehicle_type() != ProviderVehicleType::File && !is_local {
+            if content.len() > MAX_PROVIDER_SIZE {
+                return Err(anyhow::anyhow!(
+                    "provider content too large: {} bytes (max {})",
+                    content.len(),
+                    MAX_PROVIDER_SIZE
+                ));
+            }
+
             let p = self.vehicle.path().to_owned();
             let path = Path::new(p.as_str());
-            let prefix = path.parent().unwrap();
-            if !prefix.exists() {
+            if let Some(prefix) = path.parent()
+                && !prefix.as_os_str().is_empty()
+                && !prefix.exists()
+            {
                 fs::create_dir_all(prefix)?;
             }
             fs::write(self.vehicle.path(), &content)?;
         }
 
-        inner.hash = utils::md5(&content)[..16]
-            .try_into()
-            .expect("md5 must be 16 bytes");
+        inner.hash = utils::md5(&content).try_into().map_err(|_x: Vec<u8>| {
+            anyhow::anyhow!("md5 must be 16 bytes")
+        })?;
 
         drop(inner);
 
@@ -152,9 +165,10 @@ where
         let proxies = parser(&content)?;
 
         let now = SystemTime::now();
-        let hash = utils::md5(&content)[..16]
-            .try_into()
-            .expect("md5 must be 16 bytes");
+        let hash: [u8; 16] =
+            utils::md5(&content).try_into().map_err(|_x: Vec<u8>| {
+                anyhow::anyhow!("md5 must be 16 bytes")
+            })?;
 
         if hash == this.hash {
             this.updated_at = now;
@@ -163,10 +177,20 @@ where
         }
 
         if vehicle.typ() != ProviderVehicleType::File {
+            if content.len() > MAX_PROVIDER_SIZE {
+                return Err(anyhow::anyhow!(
+                    "provider content too large: {} bytes (max {})",
+                    content.len(),
+                    MAX_PROVIDER_SIZE
+                ));
+            }
+
             let p = vehicle.path().to_owned();
             let path = Path::new(p.as_str());
-            let prefix = path.parent().unwrap();
-            if !prefix.exists() {
+            if let Some(prefix) = path.parent()
+                && !prefix.as_os_str().is_empty()
+                && !prefix.exists()
+            {
                 fs::create_dir_all(prefix)?;
             }
 
@@ -241,6 +265,16 @@ where
         }));
 
         self.inner.write().await.thread_handle = thread_handle;
+    }
+}
+
+impl<U, P> Drop for Fetcher<U, P> {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner.try_write()
+            && let Some(handle) = inner.thread_handle.take()
+        {
+            handle.abort();
+        }
     }
 }
 

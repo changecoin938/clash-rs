@@ -12,7 +12,7 @@ use std::{
     collections::HashMap,
     fmt::Display,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use url::Url;
 use watfaq_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
@@ -72,7 +72,13 @@ impl Config {
                 ))
             })?;
 
-            let host = url.host_str().expect("dns host must be valid");
+            let host = url.host_str().ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "DNS nameserver [{}] missing host: {}",
+                    i,
+                    server.as_str()
+                ))
+            })?;
 
             let iface = url.fragment();
             let addr: String;
@@ -186,7 +192,9 @@ impl Config {
     }
 
     pub fn host_with_default_port(host: &str, port: &str) -> Result<String, Error> {
-        let has_port_suffix = Regex::new(r":\d+$").unwrap();
+        static HAS_PORT_SUFFIX: OnceLock<Regex> = OnceLock::new();
+        let has_port_suffix = HAS_PORT_SUFFIX
+            .get_or_init(|| Regex::new(r":\d+$").expect("valid regex"));
 
         if has_port_suffix.is_match(host) {
             Ok(host.into())

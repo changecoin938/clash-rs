@@ -5,7 +5,7 @@ use std::{
     task::Poll,
 };
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use futures::{Future, Sink, Stream, pin_mut, ready};
 use tracing::{debug, trace};
 
@@ -67,6 +67,17 @@ impl Sink<UdpPacket> for OutboundDatagramTrojan {
     ) -> Result<(), Self::Error> {
         let pin = self.get_mut();
         pin.write_buf.clear();
+
+        if item.data.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "trojan UDP packet too large: {} bytes",
+                    item.data.len()
+                ),
+            ));
+        }
+
         item.dst_addr.write_buf(&mut pin.write_buf);
         pin.write_buf.put_u16(item.data.len() as u16);
         pin.write_buf.put_slice(b"\r\n");

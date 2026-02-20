@@ -846,7 +846,7 @@ impl OutboundManager {
                         http.path,
                         Some(cwd.clone()),
                         resolver.clone(),
-                    );
+                    )?;
                     let hc = HealthCheck::new(
                         vec![],
                         http.health_check.url,
@@ -868,12 +868,9 @@ impl OutboundManager {
                     provider_registry.insert(name, Arc::new(RwLock::new(provider)));
                 }
                 OutboundProxyProviderDef::File(file) => {
-                    let vehicle = file_vehicle::Vehicle::new(
-                        PathBuf::from(cwd.clone())
-                            .join(&file.path)
-                            .to_str()
-                            .unwrap(),
-                    );
+                    let vehicle_path = PathBuf::from(cwd.clone()).join(&file.path);
+                    let vehicle_path = vehicle_path.to_string_lossy();
+                    let vehicle = file_vehicle::Vehicle::new(vehicle_path.as_ref());
                     let hc = HealthCheck::new(
                         vec![],
                         file.health_check.url,

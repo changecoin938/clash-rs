@@ -60,7 +60,9 @@ impl FakeDns {
             max,
             min,
             gateway: min - 1,
-            offset: 0,
+            // Keep `offset` within [0, max - min] so that `min + offset` always stays in-range.
+            // Initializing it to the last index makes the first allocation start from `min`.
+            offset: max - min,
             skipped_hostnames: opt.skipped_hostnames,
             ipnet: opt.ipnet,
             store: opt.store,
@@ -128,22 +130,22 @@ impl FakeDns {
         let current = self.offset;
 
         loop {
-            self.offset = (self.offset + 1) % (self.max - self.min);
+            self.offset = (self.offset + 1) % (self.max - self.min + 1);
 
             if self.offset == current {
-                self.offset = (self.offset + 1) % (self.max - self.min);
-                let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
+                self.offset = (self.offset + 1) % (self.max - self.min + 1);
+                let ip = net::Ipv4Addr::from(self.min + self.offset);
                 self.store.del_by_ip(std::net::IpAddr::V4(ip)).await;
                 break;
             }
 
-            let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
+            let ip = net::Ipv4Addr::from(self.min + self.offset);
             if !self.store.exist(std::net::IpAddr::V4(ip)).await {
                 break;
             }
         }
 
-        let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
+        let ip = net::Ipv4Addr::from(self.min + self.offset);
         self.store.put_by_ip(std::net::IpAddr::V4(ip), host).await;
         std::net::IpAddr::V4(ip)
     }

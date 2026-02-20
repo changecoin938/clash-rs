@@ -154,10 +154,10 @@ impl EnhancedResolver {
                 hickory_resolver::dns_lru::DnsLru::new(
                     4096,
                     hickory_resolver::dns_lru::TtlConfig::new(
-                        Some(Duration::from_secs(1)),
-                        Some(Duration::from_secs(1)),
-                        Some(Duration::from_secs(60)),
-                        Some(Duration::from_secs(10)),
+                        Some(Duration::from_secs(1)),    // min positive TTL
+                        Some(Duration::from_secs(3600)), // max positive TTL
+                        Some(Duration::from_secs(30)),   // min negative TTL
+                        Some(Duration::from_secs(300)),  // max negative TTL
                     ),
                 ),
             ))),
@@ -211,11 +211,7 @@ impl EnhancedResolver {
 
             reverse_lookup_cache: Some(Arc::new(RwLock::new(
                 lru_time_cache::LruCache::with_expiry_duration_and_capacity(
-                    Duration::from_secs(3), /* should be shorter than TTL so
-                                             * client won't be connecting to a
-                                             * different server after the ip is
-                                             * reverse mapped to hostname and
-                                             * being resolved again */
+                    Duration::from_secs(60),
                     4096,
                 ),
             ))),
@@ -291,8 +287,8 @@ impl EnhancedResolver {
             if let Some(lru) = &self.lru_cache
                 && let Some(cached) = lru.read().await.get(q, Instant::now())
             {
-                if !message.recursion_desired() {
-                    trace!(q = q.to_string(), "cache hit, RA not desired");
+                if message.recursion_desired() {
+                    trace!(q = q.to_string(), "cache hit, RD desired");
                     if let Ok(cached) = cached.inspect_err(|x| {
                         warn!("failed to get cached message: {}", x);
                     }) {
@@ -308,7 +304,7 @@ impl EnhancedResolver {
                 } else {
                     trace!(
                         q = q.to_string(),
-                        "cache hit, RA desired, bypassing cache",
+                        "cache hit, RD not desired, bypassing cache",
                     );
                 }
             }
@@ -331,7 +327,7 @@ impl EnhancedResolver {
         &self,
         message: &op::Message,
     ) -> anyhow::Result<op::Message> {
-        let q = message.query().unwrap();
+        let q = message.query().ok_or_else(|| anyhow!("invalid query"))?;
 
         let query = async move {
             if EnhancedResolver::is_ip_request(q) {
@@ -352,9 +348,16 @@ impl EnhancedResolver {
             && !(q.query_type() == rr::RecordType::TXT
                 && q.name().to_ascii().starts_with("_acme-challenge."))
         {
+            // Cache both positive answers and negative (NXDOMAIN/NODATA) responses.
+            // For negative responses, SOA in the authority section provides negative TTL.
+            let records = if msg.answers().is_empty() {
+                msg.name_servers().iter().cloned()
+            } else {
+                msg.answers().iter().cloned()
+            };
             lru.write().await.insert_records(
                 q.clone(),
-                msg.answers().iter().cloned(),
+                records,
                 Instant::now(),
             );
         }
@@ -367,7 +370,7 @@ impl EnhancedResolver {
             (&self.fallback, &self.fallback_domain_filters, &self.policy)
             && let Some(domain) = EnhancedResolver::domain_name_of_message(m)
         {
-            return policy.search(&domain).map(|n| n.get_data().unwrap());
+            return policy.search(&domain).and_then(|n| n.get_data());
         }
         None
     }
@@ -383,7 +386,9 @@ impl EnhancedResolver {
 
         if self.should_only_query_fallback(message) {
             return EnhancedResolver::batch_exchange(
-                self.fallback.as_ref().unwrap(),
+                self.fallback
+                    .as_ref()
+                    .expect("checked by should_only_query_fallback"),
                 message,
             )
             .await;
@@ -396,7 +401,7 @@ impl EnhancedResolver {
         }
 
         let fallback_query = EnhancedResolver::batch_exchange(
-            self.fallback.as_ref().unwrap(),
+            self.fallback.as_ref().expect("checked above"),
             message,
         );
 
@@ -522,22 +527,29 @@ impl ClashResolver for EnhancedResolver {
         }
 
         if enhanced && self.fake_ip_enabled() {
-            let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
-            if !fake_dns.should_skip(host) {
-                let ip = fake_dns.lookup(host).await;
-                debug!("fake dns lookup: {} -> {:?}", host, ip);
-                match ip {
-                    net::IpAddr::V4(v4) => return Ok(Some(v4)),
-                    _ => unreachable!("invalid IP family"),
+            if let Some(fake_dns) = self.fake_dns.as_ref() {
+                let mut fake_dns = fake_dns.write().await;
+                if !fake_dns.should_skip(host) {
+                    let ip = fake_dns.lookup(host).await;
+                    debug!("fake dns lookup: {} -> {:?}", host, ip);
+                    match ip {
+                        net::IpAddr::V4(v4) => return Ok(Some(v4)),
+                        _ => unreachable!("invalid IP family"),
+                    }
                 }
             }
         }
 
         match self.lookup_ip(host, rr::RecordType::A).await {
-            Ok(result) => match result.choose(&mut rand::rng()).unwrap() {
-                net::IpAddr::V4(v4) => Ok(Some(*v4)),
-                _ => unreachable!("invalid IP family"),
-            },
+            Ok(result) => {
+                let ip = result.choose(&mut rand::rng()).ok_or_else(|| {
+                    anyhow!("no record for hostname: {}", host)
+                })?;
+                match ip {
+                    net::IpAddr::V4(v4) => Ok(Some(*v4)),
+                    _ => unreachable!("invalid IP family"),
+                }
+            }
             Err(e) => Err(e),
         }
     }
@@ -566,10 +578,15 @@ impl ClashResolver for EnhancedResolver {
         }
 
         match self.lookup_ip(host, rr::RecordType::AAAA).await {
-            Ok(result) => match result.choose(&mut rand::rng()).unwrap() {
-                net::IpAddr::V6(v6) => Ok(Some(*v6)),
-                _ => unreachable!("invalid IP family"),
-            },
+            Ok(result) => {
+                let ip = result.choose(&mut rand::rng()).ok_or_else(|| {
+                    anyhow!("no record for hostname: {}", host)
+                })?;
+                match ip {
+                    net::IpAddr::V6(v6) => Ok(Some(*v6)),
+                    _ => unreachable!("invalid IP family"),
+                }
+            }
 
             Err(e) => Err(e),
         }
@@ -589,10 +606,10 @@ impl ClashResolver for EnhancedResolver {
 
     #[instrument(skip(self), level = "trace")]
     async fn exchange(&self, message: &op::Message) -> anyhow::Result<op::Message> {
-        let rv = self.exchange(message).await?;
+        let rv = EnhancedResolver::exchange(self, message).await?;
         let hostname = message
             .query()
-            .unwrap()
+            .ok_or_else(|| anyhow!("invalid query"))?
             .name()
             .to_utf8()
             .trim_end_matches('.')
@@ -627,8 +644,12 @@ impl ClashResolver for EnhancedResolver {
             return false;
         }
 
-        let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
-        fake_dns.is_fake_ip(ip).await
+        if let Some(fake_dns) = self.fake_dns.as_ref() {
+            let mut fake_dns = fake_dns.write().await;
+            fake_dns.is_fake_ip(ip).await
+        } else {
+            false
+        }
     }
 
     async fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
@@ -637,8 +658,12 @@ impl ClashResolver for EnhancedResolver {
             return None;
         }
 
-        let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
-        fake_dns.reverse_lookup(ip).await
+        if let Some(fake_dns) = self.fake_dns.as_ref() {
+            let mut fake_dns = fake_dns.write().await;
+            fake_dns.reverse_lookup(ip).await
+        } else {
+            None
+        }
     }
 }
 
